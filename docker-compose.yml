@@ -1,0 +1,57 @@
+
+services:
+  cockroach1:
+    image: cockroachdb/cockroach:v26.2.2
+    container_name: distributed-ml-db1
+    command:
+      - start
+      - --insecure
+      - --store=/cockroach/cockroach-data
+      - --listen-addr=0.0.0.0:26257
+      - --advertise-addr=cockroach1:26257
+      - --http-addr=0.0.0.0:8080
+      - --join=cockroach1:26257,cockroach2:26257,cockroach3:26257
+    ports:
+      - "26257:26257"
+      - "8080:8080"
+    volumes:
+      - db1-data:/cockroach/cockroach-data
+
+  cockroach2:
+    image: cockroachdb/cockroach:v26.2.2
+    container_name: distributed-ml-db2
+    command:
+      - start
+      - --insecure
+      - --store=/cockroach/cockroach-data
+      - --listen-addr=0.0.0.0:26257
+      - --advertise-addr=cockroach2:26257
+      - --http-addr=0.0.0.0:8080
+      - --join=cockroach1:26257,cockroach2:26257,cockroach3:26257
+    ports:
+      - "26258:26257"
+      - "8081:8080"
+    volumes:
+      - db2-data:/cockroach/cockroach-data
+
+  cockroach3:
+    image: cockroachdb/cockroach:v26.2.2
+    container_name: distributed-ml-db3
+    command:
+      - start
+      - --insecure
+      - --store=/cockroach/cockroach-data
+      - --listen-addr=0.0.0.0:26257
+      - --advertise-addr=cockroach3:26257
+      - --http-addr=0.0.0.0:8080
+      - --join=cockroach1:26257,cockroach2:26257,cockroach3:26257
+    ports:
+      - "26259:26257"
+      - "8082:8080"
+    volumes:
+      - db3-data:/cockroach/cockroach-data
+
+volumes:
+  db1-data:
+  db2-data:
+  db3-data:

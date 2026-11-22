@@ -1,0 +1,1 @@
+-- CockroachDB's existing schema is managed outside this task; do not run DDL here.
