@@ -7,6 +7,8 @@ from fastapi.responses import JSONResponse
 from psycopg import Error as PsycopgError
 from psycopg_pool import PoolTimeout
 
+from api.datasets import router as datasets_router
+from api.jobs import router as jobs_router
 from api.nodes import router as nodes_router
 from database.connection import (
     check_database_connection,
@@ -28,6 +30,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Distributed ML API", lifespan=lifespan)
 app.include_router(nodes_router)
+app.include_router(datasets_router)
+app.include_router(jobs_router)
 
 
 @app.get("/health")

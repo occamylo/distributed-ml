@@ -15,9 +15,9 @@ from database.repository import (
     get_dataset,
     get_leadership,
     list_jobs,
-    list_nodes,
+    list_nodes_with_fresh_metrics,
     list_tasks_by_job,
-    update_job,
+    update_job_as_leader,
 )
 from workers.coordination import WorkerCoordination
 
@@ -211,16 +211,23 @@ class Scheduler:
 
         if not self._retains_leadership(epoch):
             return False
-        updated_job = update_job(
+        updated_job = update_job_as_leader(
             job_id,
+            "pending",
             {
                 "status": "running",
                 "actual_workers": actual_workers,
                 "started_at": job.get("started_at") or datetime.now(timezone.utc),
             },
+            self._coordination.node_id,
+            epoch,
+            DEFAULT_CLUSTER_ID,
         )
         if updated_job is None:
-            logger.error("Job %s disappeared while being scheduled.", job_id)
+            logger.warning(
+                "Job %s was not updated because leadership or its pending state changed.",
+                job_id,
+            )
         else:
             logger.info(
                 "Scheduled Job %s with %s Worker(s) at leadership epoch %s.",
@@ -232,7 +239,7 @@ class Scheduler:
 
     def _eligible_workers(self, requested_workers: int) -> list[Record]:
         eligible: list[Record] = []
-        for node in list_nodes():
+        for node in list_nodes_with_fresh_metrics():
             node_id = node.get("node_id")
             cpu_available = node.get("cpu_available_cores")
             ram_available = node.get("ram_available_mb")

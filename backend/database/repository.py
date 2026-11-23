@@ -15,6 +15,7 @@ from database.connection import get_pool
 Record = dict[str, Any]
 DEFAULT_CLUSTER_ID = "default"
 DEFAULT_LEASE_DURATION_SECONDS = 10.0
+WORKER_STALE_AFTER_SECONDS = 10.0
 MAX_SERIALIZATION_ATTEMPTS = 5
 _T = TypeVar("_T")
 
@@ -307,6 +308,17 @@ def list_nodes() -> list[Record]:
     )
 
 
+def list_nodes_with_fresh_metrics() -> list[Record]:
+    freshness_interval = timedelta(seconds=WORKER_STALE_AFTER_SECONDS)
+    return _fetch_all(
+        "SELECT * FROM nodes "
+        "WHERE last_heartbeat >= now() - %s "
+        "AND metrics_updated_at >= now() - %s "
+        "ORDER BY created_at ASC, node_id ASC",
+        (freshness_interval, freshness_interval),
+    )
+
+
 def update_node(node_id: UUID, fields: Mapping[str, Any]) -> Record | None:
     return _update(
         "nodes",
@@ -315,6 +327,14 @@ def update_node(node_id: UUID, fields: Mapping[str, Any]) -> Record | None:
         fields,
         _NODE_UPDATE_FIELDS,
         touch_updated_at=True,
+    )
+
+
+def update_node_heartbeat(node_id: UUID) -> Record | None:
+    return _fetch_one(
+        "UPDATE nodes SET status = %s, last_heartbeat = now(), updated_at = now() "
+        "WHERE node_id = %s RETURNING *",
+        ("online", node_id),
     )
 
 
@@ -331,6 +351,22 @@ def update_node_metrics(
         "WHERE node_id = %s RETURNING *",
         ("online", cpu_available_cores, ram_available_mb, active_tasks, node_id),
     )
+
+
+def mark_stale_nodes_offline() -> list[Record]:
+    freshness_interval = timedelta(seconds=WORKER_STALE_AFTER_SECONDS)
+
+    def mark_stale(cursor: Any) -> list[Record]:
+        cursor.execute(
+            "UPDATE nodes SET status = 'offline', updated_at = now() "
+            "WHERE status = 'online' "
+            "AND (last_heartbeat IS NULL OR last_heartbeat < now() - %s) "
+            "RETURNING node_id",
+            (freshness_interval,),
+        )
+        return list(cursor.fetchall())
+
+    return _run_leadership_transaction(mark_stale)
 
 
 def create_dataset(
@@ -423,6 +459,54 @@ def update_job(job_id: UUID, fields: Mapping[str, Any]) -> Record | None:
         _JOB_UPDATE_FIELDS,
         json_fields=("parameters",),
     )
+
+
+def update_job_as_leader(
+    job_id: UUID,
+    expected_status: str,
+    fields: Mapping[str, Any],
+    leader_node_id: UUID,
+    leader_epoch: int,
+    cluster_id: str = DEFAULT_CLUSTER_ID,
+) -> Record | None:
+    if "status" not in fields:
+        raise ValueError("A leader Job update must include the new status.")
+
+    unknown_fields = set(fields).difference(_JOB_UPDATE_FIELDS)
+    if unknown_fields:
+        names = ", ".join(sorted(unknown_fields))
+        raise ValueError(f"Unsupported update field(s) for jobs: {names}")
+
+    assignments = [
+        sql.SQL("{} = %s").format(sql.Identifier(column))
+        for column in fields
+    ]
+    query = sql.SQL(
+        "UPDATE {} SET {} WHERE {} = %s AND {} = %s RETURNING *"
+    ).format(
+        sql.Identifier("jobs"),
+        sql.SQL(", ").join(assignments),
+        sql.Identifier("job_id"),
+        sql.Identifier("status"),
+    )
+    values = tuple(
+        Jsonb(value) if column == "parameters" else value
+        for column, value in fields.items()
+    )
+
+    def update(cursor: Any) -> Record | None:
+        if not _lock_current_leadership(
+            cursor,
+            leader_node_id,
+            leader_epoch,
+            cluster_id,
+        ):
+            return None
+
+        cursor.execute(query, (*values, job_id, expected_status))
+        return cursor.fetchone()
+
+    return _run_leadership_transaction(update)
 
 
 def create_task(

@@ -1,4 +1,3 @@
-from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -30,13 +29,7 @@ def register_node(node: NodeRegistration) -> dict[str, Any]:
 
 @router.post("/nodes/{node_id}/heartbeat")
 def receive_heartbeat(node_id: UUID) -> dict[str, Any]:
-    updated_node = repository.update_node(
-        node_id,
-        {
-            "last_heartbeat": datetime.now(timezone.utc),
-            "status": "online",
-        },
-    )
+    updated_node = repository.update_node_heartbeat(node_id)
     if updated_node is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

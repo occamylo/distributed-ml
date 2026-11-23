@@ -19,7 +19,11 @@ from psycopg_pool import PoolTimeout
 
 from coordinator.scheduler import Scheduler
 from database.connection import close_pool, initialize_pool
-from database.repository import get_node, update_node_metrics
+from database.repository import (
+    get_node,
+    mark_stale_nodes_offline,
+    update_node_metrics,
+)
 from workers.coordination import WorkerCoordination
 
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 3.0
@@ -390,6 +394,22 @@ def run_worker(
                 coordination.start()
                 scheduler = Scheduler(coordination)
                 scheduler.start()
+
+            try:
+                stale_nodes = mark_stale_nodes_offline()
+            except (OperationalError, PoolTimeout, SerializationFailure) as exc:
+                logger.warning(
+                    "Worker %s could not mark stale nodes offline (%s).",
+                    node_id,
+                    type(exc).__name__,
+                )
+            else:
+                if stale_nodes:
+                    logger.info(
+                        "Worker %s marked %s stale node(s) offline.",
+                        node_id,
+                        len(stale_nodes),
+                    )
 
             try:
                 cpu_available_cores = _get_cpu_available_cores()
