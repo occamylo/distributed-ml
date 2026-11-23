@@ -1,15 +1,22 @@
-from collections.abc import Mapping, Sequence
-from datetime import datetime
-from typing import Any
+import math
+import time
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timedelta
+from typing import Any, TypeVar
 from uuid import UUID
 
 from psycopg import sql
+from psycopg.errors import SerializationFailure
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from database.connection import get_pool
 
 Record = dict[str, Any]
+DEFAULT_CLUSTER_ID = "default"
+DEFAULT_LEASE_DURATION_SECONDS = 10.0
+MAX_SERIALIZATION_ATTEMPTS = 5
+_T = TypeVar("_T")
 
 _NODE_UPDATE_FIELDS = (
     "hostname",
@@ -44,6 +51,11 @@ _TASK_UPDATE_FIELDS = (
     "completed_at",
     "error_message",
 )
+_LEADERSHIP_SELECT = (
+    "SELECT cluster_id, leader_node_id, epoch, lease_until, updated_at, "
+    "lease_until > now() AS is_valid "
+    "FROM cluster_leadership WHERE cluster_id = %s"
+)
 
 
 def _fetch_one(query: str | sql.Composable, params: Sequence[Any]) -> Record | None:
@@ -58,6 +70,134 @@ def _fetch_all(query: str | sql.Composable, params: Sequence[Any] = ()) -> list[
         with connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(query, params)
             return list(cursor.fetchall())
+
+
+def _run_leadership_transaction(operation: Callable[[Any], _T]) -> _T:
+    for attempt in range(MAX_SERIALIZATION_ATTEMPTS):
+        try:
+            with get_pool().connection() as connection:
+                with connection.transaction():
+                    with connection.cursor(row_factory=dict_row) as cursor:
+                        return operation(cursor)
+        except SerializationFailure:
+            if attempt + 1 == MAX_SERIALIZATION_ATTEMPTS:
+                raise
+            time.sleep(min(0.01 * (2**attempt), 0.1))
+    raise RuntimeError("Leadership transaction exhausted without a result.")
+
+
+def _lease_duration(seconds: float) -> timedelta:
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("Lease duration must be a finite value greater than zero.")
+    duration = timedelta(seconds=seconds)
+    if duration <= timedelta(0):
+        raise ValueError("Lease duration is below the supported timestamp precision.")
+    return duration
+
+
+def initialize_leadership(cluster_id: str = DEFAULT_CLUSTER_ID) -> Record:
+    def initialize(cursor: Any) -> Record:
+        cursor.execute(
+            "INSERT INTO cluster_leadership "
+            "(cluster_id, leader_node_id, epoch, lease_until, updated_at) "
+            "VALUES (%s, NULL, 0, now(), now()) "
+            "ON CONFLICT (cluster_id) DO NOTHING",
+            (cluster_id,),
+        )
+        cursor.execute(_LEADERSHIP_SELECT, (cluster_id,))
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError(f"Leadership row {cluster_id!r} was not initialized.")
+        return row
+
+    return _run_leadership_transaction(initialize)
+
+
+def get_leadership(cluster_id: str = DEFAULT_CLUSTER_ID) -> Record | None:
+    return _fetch_one(_LEADERSHIP_SELECT, (cluster_id,))
+
+
+def acquire_leadership(
+    node_id: UUID,
+    observed_epoch: int,
+    lease_duration_seconds: float = DEFAULT_LEASE_DURATION_SECONDS,
+    cluster_id: str = DEFAULT_CLUSTER_ID,
+) -> Record | None:
+    duration = _lease_duration(lease_duration_seconds)
+
+    def acquire(cursor: Any) -> Record | None:
+        cursor.execute(
+            "UPDATE cluster_leadership "
+            "SET leader_node_id = %s, epoch = epoch + 1, "
+            "lease_until = now() + %s, updated_at = now() "
+            "WHERE cluster_id = %s AND epoch = %s "
+            "AND (leader_node_id IS NULL OR lease_until <= now()) "
+            "RETURNING cluster_id, leader_node_id, epoch, lease_until, updated_at, "
+            "lease_until > now() AS is_valid",
+            (node_id, duration, cluster_id, observed_epoch),
+        )
+        return cursor.fetchone()
+
+    return _run_leadership_transaction(acquire)
+
+
+def renew_leadership(
+    node_id: UUID,
+    epoch: int,
+    lease_duration_seconds: float = DEFAULT_LEASE_DURATION_SECONDS,
+    cluster_id: str = DEFAULT_CLUSTER_ID,
+) -> Record | None:
+    duration = _lease_duration(lease_duration_seconds)
+
+    def renew(cursor: Any) -> Record | None:
+        cursor.execute(
+            "UPDATE cluster_leadership "
+            "SET lease_until = now() + %s, updated_at = now() "
+            "WHERE cluster_id = %s AND leader_node_id = %s AND epoch = %s "
+            "AND lease_until > now() "
+            "RETURNING cluster_id, leader_node_id, epoch, lease_until, updated_at, "
+            "lease_until > now() AS is_valid",
+            (duration, cluster_id, node_id, epoch),
+        )
+        return cursor.fetchone()
+
+    return _run_leadership_transaction(renew)
+
+
+def release_leadership(
+    node_id: UUID,
+    epoch: int,
+    cluster_id: str = DEFAULT_CLUSTER_ID,
+) -> bool:
+    def release(cursor: Any) -> bool:
+        cursor.execute(
+            "UPDATE cluster_leadership "
+            "SET leader_node_id = NULL, lease_until = now(), updated_at = now() "
+            "WHERE cluster_id = %s AND leader_node_id = %s AND epoch = %s "
+            "RETURNING cluster_id",
+            (cluster_id, node_id, epoch),
+        )
+        return cursor.fetchone() is not None
+
+    return _run_leadership_transaction(release)
+
+
+def validate_leadership(
+    node_id: UUID,
+    epoch: int,
+    cluster_id: str = DEFAULT_CLUSTER_ID,
+) -> bool:
+    row = _fetch_one(
+        "SELECT EXISTS ("
+        "SELECT 1 FROM cluster_leadership "
+        "WHERE cluster_id = %s AND leader_node_id = %s AND epoch = %s "
+        "AND lease_until > now()"
+        ") AS is_valid",
+        (cluster_id, node_id, epoch),
+    )
+    if row is None:
+        raise RuntimeError("Leadership validation did not return a result.")
+    return row["is_valid"]
 
 
 def _insert(table: str, values: Mapping[str, Any]) -> Record:

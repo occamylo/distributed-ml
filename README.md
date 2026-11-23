@@ -33,22 +33,46 @@ disponibilidad de nodos, recuperación ante una falla de Worker y
 resultados de entrenamiento. No se busca construir una plataforma de ML
 distribuido de producción.
 
+### Estado de implementación y arquitectura objetivo
+
+El alcance descrito en este README es el objetivo del MVP, no una
+afirmación de que todas sus funciones ya estén implementadas. El código
+actual incluye el pool de CockroachDB, el health check de FastAPI, el
+registro/Heartbeat básico de Workers y un cliente Worker invocable como
+proceso Python. También incluye la tabla y las operaciones básicas del
+lease persistente de liderazgo. El cliente Worker sigue dependiendo de
+FastAPI; no ejecuta entrenamiento ni detecta Workers desconectados.
+
+La elección automática del coordinador Worker, la puntuación de
+capacidad, la comunicación Worker-a-Worker, la recuperación de Tasks y
+un ingreso público tolerante a fallos son propuestas pendientes. El diseño
+detallado está en
+[docs/distributed-coordination-architecture.md](docs/distributed-coordination-architecture.md).
+La conexión, el esquema y las operaciones de lease se verificaron contra
+CockroachDB v26.2.2. No se verificaron el factor de replicación efectivo
+ni el quórum, ni la integración real del cliente Worker con la tabla
+`nodes`.
+
 ------------------------------------------------------------------------
 
 ## 2. Alcance y límites del MVP
 
-### Incluido
+### Alcance funcional previsto del MVP
+
+Esta lista describe el alcance final deseado del MVP; las funciones no
+marcadas como implementación actual siguen pendientes.
 
 -   Aplicación web de uso local.
 -   Carga y validación de archivos CSV.
 -   Almacenamiento local de archivos CSV; la base de datos conserva sus
     metadatos y rutas, no el contenido binario del CSV.
--   Un Backend/API central basado en FastAPI que coordina la aplicación
-    y los Workers.
+-   Un Backend/API basado en FastAPI como punto de entrada inicial. La
+    coordinación completa por Worker es una propuesta posterior.
 -   Un clúster CockroachDB de **3 nodos**.
--   Un clúster de cómputo con **3 Workers iniciales**, replicables
-    mediante Docker Compose.
--   Registro de Workers, detección de disponibilidad y Heartbeats.
+-   Tres Workers ejecutables como procesos Python independientes; el
+    Compose actual no declara servicios Worker.
+-   Registro y Heartbeat básicos de Workers (implementados); detección
+    de desconexión y transición automática a `offline` pendientes.
 -   Scheduler con asignación de tareas teniendo en cuenta Workers
     disponibles y carga/capacidad conocida.
 -   Cola de tareas, particionamiento del dataset de entrenamiento y
@@ -72,7 +96,9 @@ distribuido de producción.
     hosts. Inicialmente los contenedores se ejecutan en un solo PC.
 -   Worker Agent para que voluntarios conecten sus propios equipos desde
     Internet.
--   Recuperación automática de la caída del Coordinator/Backend.
+-   La recuperación del Coordinator/Backend no está implementada en el
+    MVP centralizado; su arquitectura objetivo se documenta como una
+    etapa posterior.
 -   Ejecución simultánea de múltiples entrenamientos (MVP utiliza cola y
     ejecuta un Job a la vez).
 -   Checkpoints persistentes que permitan reiniciar un entrenamiento
@@ -191,62 +217,88 @@ inicial es **3 Workers**:
 -   Worker 2
 -   Worker 3
 
-Los Workers son procesos/containers independientes que ejecutan el mismo
-código Worker, pero con identidad y estado propios. Un único servicio
-Docker Compose puede replicarse a tres instancias; no se crea un clúster
-separado por Worker.
+El estado actual permite ejecutar el mismo cliente Worker en procesos
+Python independientes. Cada arranque crea su propio registro y conserva
+el UUID devuelto mientras vive el proceso. El cliente se inicia
+manualmente y usa HTTP hacia FastAPI; el `docker-compose.yml` actual solo
+declara nodos CockroachDB, no servicios Worker.
 
-El diseño permite conceptualmente un número N de Workers, aunque el MVP
-se configura y demuestra con tres. La cantidad de instancias estará
-limitada por la RAM, CPU y capacidad del host. Todos los Workers locales
-comparten el mismo PC y no representan máquinas físicas independientes.
+Tres procesos en el mismo PC no son tres dominios de fallo físicos. Una
+arquitectura multi-host requerirá direcciones anunciadas y conectividad
+entre equipos; la elección de líder y el servidor de coordinación Worker
+aún no están implementados.
 
 ### 4.3 Coordinator
 
-FastAPI actúa como Coordinator central y es responsable de:
+**Implementado actualmente:** FastAPI inicializa el pool, expone
+`/health`, `POST /nodes` y `POST /nodes/{node_id}/heartbeat`. El
+Heartbeat actual marca el nodo `online` y actualiza `last_heartbeat`;
+no existe expiración que lo cambie a `offline`. Los Workers dependen de
+FastAPI para estas operaciones.
 
--   Recibir solicitudes de la aplicación web.
--   Registrar datasets y crear Jobs.
--   Mantener y consultar el estado de Workers.
--   Gestionar Heartbeats y detectar Workers que dejan de responder.
--   Seleccionar Workers elegibles.
--   Dividir datos de entrenamiento en particiones/tareas.
--   Encolar, asignar y reencolar tareas.
--   Enviar a los Workers datos de su tarea y pesos actuales del modelo.
--   Recibir resultados de los Workers y validar que correspondan al
-    Job/iteración/tarea.
--   Agregar gradientes y actualizar el modelo global.
--   Coordinar reintentos y recuperación de tareas pendientes.
--   Evaluar el modelo final y persistir métricas/resultados.
--   Exponer estado global de Jobs a la interfaz.
+**Pendiente:** Scheduler, cola de tareas, asignación, entrenamiento,
+agregación y recuperación no están implementados en estos módulos.
 
-### 4.4 Vista conceptual
+**Objetivo propuesto:** FastAPI puede permanecer como ingreso público,
+pero los Workers descubren al coordinador activo desde CockroachDB y se
+comunican con él directamente. La elección segura por lease y la
+continuidad de la API pública se detallan en
+[la propuesta de arquitectura](docs/distributed-coordination-architecture.md).
+
+### 4.4 Vista de la implementación actual
 
 ``` text
-                  FRONTEND WEB
-          (HTML + CSS + JavaScript)
-                       |
-                    HTTP API
-                       |
-             BACKEND / COORDINATOR
-                    FastAPI
-            /          |           \
-           /           |            \
-   Scheduler      Training       Repository
-   + Queue        Coordinator     / DB access
-       |               |              |
-       |               |        CockroachDB cluster
-       |               |       DB1 -- DB2 -- DB3
-       |               |
-       |       Compute Cluster
-       |       /      |       \
-       |   Worker 1 Worker 2 Worker 3
-       |       \      |       /
-       |         Task Results
-       |
-   Local Dataset Storage
-   (CSV files)
+ Worker process 1 ----\
+ Worker process 2 -----+-- HTTP --> FastAPI
+ Worker process 3 ----/             |  /health
+                                    |  POST /nodes
+                                    |  POST /nodes/{id}/heartbeat
+                                    v
+                              Repository / pool
+                                    |
+                              CockroachDB
 ```
+
+Este diagrama describe solo el camino de registro/Heartbeat; no implica
+que ya exista ejecución de Tasks, Scheduler ni coordinación distribuida.
+
+### 4.5 Lease persistente de liderazgo
+
+Se agregó la migración aditiva
+[`001_create_cluster_leadership.sql`](backend/database/migrations/001_create_cluster_leadership.sql)
+y operaciones en
+[`repository.py`](backend/database/repository.py) para inicializar y
+consultar el clúster `default`, adquirir, renovar, liberar y validar un
+lease con época. La fila inicial no tiene propietario, tiene `epoch=0` y
+un lease expirado.
+
+La duración predeterminada del lease es 10 segundos y se puede
+sobrescribir en las operaciones de adquisición/renovación. La cadencia
+de 3 segundos es solo la referencia futura para un renovador periódico;
+esta tarea no implementa ese proceso ni la elección automática de
+Workers. Las consultas de vigencia usan el reloj de CockroachDB; los
+conflictos de serialización se reintentan hasta cinco intentos con
+backoff acotado.
+
+La migración es idempotente y no restablece un epoch o propietario
+existente. Desde PowerShell, con CockroachDB iniciado:
+
+```powershell
+Get-Content -Raw .\backend\database\migrations\001_create_cluster_leadership.sql | docker exec -i distributed-ml-db1 cockroach sql --insecure --database=distributed_ml
+```
+
+Las pruebas de integración usan la base real y requieren dos Workers
+registrados y ningún lease `default` vigente:
+
+```powershell
+Set-Location .\backend
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+En CockroachDB v26.2.2 se ejecutaron correctamente las ocho pruebas,
+incluida una adquisición concurrente con dos conexiones independientes:
+solo una obtuvo el liderazgo. La fila quedó liberada y el epoch no se
+reinició.
 
 ------------------------------------------------------------------------
 
@@ -254,46 +306,46 @@ FastAPI actúa como Coordinator central y es responsable de:
 
 ### Paso 1. Iniciar el sistema
 
-Se inicia el entorno con Docker Compose. Se levantan:
+El Compose actual define los tres servicios CockroachDB. FastAPI y los
+Workers se ejecutan como procesos separados. Para iniciar cada Worker
+desde `backend/`, se usa
+`python -m workers.worker --backend-url http://127.0.0.1:8000` en una
+terminal independiente; se requieren tres terminales para tres procesos.
+La URL debe apuntar al Backend que realmente esté en ejecución.
 
--   Coordinator/Backend FastAPI.
--   Tres nodos CockroachDB, unidos a un único clúster.
--   Tres instancias Worker.
--   Red virtual Docker para comunicación entre servicios.
+El proceso FastAPI comprueba su conexión a la base al iniciar. La
+integración de esos procesos con una base CockroachDB activa debe
+verificarse en el entorno de ejecución.
 
-El Backend comprueba la conexión a la base de datos. Los Workers se
-inician y se registran. La interfaz puede consultar el estado general
-del sistema.
-
-**Parámetros iniciales:** - Nodos DB: 3. - Workers: 3. - Un solo host
-físico. - Servicios comunicados por la red Docker. - Los valores de
-CPU/RAM para contenedores se ajustarán a la capacidad del PC; no se
-asumirán recursos ilimitados.
+**Entorno actual:** tres nodos DB configurados por Compose; Workers
+locales como procesos Python; todos comparten el mismo host físico.
+No se declara una red Docker para los Workers.
 
 ### Paso 2. Registro de Workers y Heartbeat
 
 Al arrancar, cada Worker:
 
-1.  Se identifica ante el Coordinator.
-2.  Envía su hostname/identificador y capacidades detectadas (CPU y
-    RAM).
-3.  El Coordinator registra o actualiza su fila en `nodes`.
-4.  El Worker comienza a enviar Heartbeats periódicos.
-5.  El Backend mantiene el estado del Worker (`online`, `busy`,
-    `offline`) y su última señal recibida.
+1.  Obtiene hostname, IP si está disponible, núcleos y RAM total.
+2.  Envía esa información a `POST /nodes`; el Backend crea una fila y
+    devuelve el UUID generado por la base de datos.
+3.  Conserva el `node_id` durante ese proceso. Un nuevo arranque crea
+    otro registro; no hay deduplicación por hostname.
+4.  Envía `POST /nodes/{node_id}/heartbeat` cada 3 segundos por defecto.
+5.  El endpoint actualiza `last_heartbeat` y establece el estado
+    `online`. El Repository actualiza también `updated_at`.
 
 El registro de Workers se mantiene en la tabla `nodes`, que representa
 **Workers de cómputo exclusivamente**, no nodos CockroachDB.
 
-**Heartbeat y timeout:** se usarán intervalos configurables. Como punto
-de partida para pruebas, puede enviarse un Heartbeat cada 3 segundos y
-considerar un Worker sospechoso/inactivo tras aproximadamente 10
-segundos sin señal. Son valores iniciales ilustrativos que deben
-calibrarse y definirse en configuración, no valores inmutables de
-arquitectura.
+El Heartbeat actual no incluye métricas dinámicas y no existe un monitor
+que marque `offline` a un nodo vencido. El timeout cercano a 10 segundos
+es una referencia para el diseño objetivo, no un comportamiento
+implementado. La propuesta de elección de coordinador y métricas está
+en [la arquitectura distribuida](docs/distributed-coordination-architecture.md).
 
-La detección no es instantánea: existe un tiempo de espera y un Worker
-puede parecer desconectado por latencia o bloqueo temporal.
+Un Heartbeat recibido solo confirma comunicación reciente con FastAPI;
+no confirma salud de entrenamiento, disponibilidad de CPU/RAM ni
+elegibilidad para coordinar.
 
 ### Paso 3. Carga del dataset
 
@@ -670,8 +722,10 @@ monitoreo avanzado de salud.
 ## 7. Estructura de la base de datos
 
 La base de datos lógica es CockroachDB, distribuida en tres nodos
-físicos simulados (contenedores). Las cinco tablas siguientes almacenan
-la información de Workers, datasets, Jobs, tareas y resultados.
+simulados (contenedores). Las cinco tablas operativas descritas abajo
+almacenan Workers, datasets, Jobs, Tasks y resultados. La tabla adicional
+`cluster_leadership`, creada por la migración versionada, almacena el
+lease del coordinador.
 
 ### Relaciones
 
@@ -690,6 +744,8 @@ la información de Workers, datasets, Jobs, tareas y resultados.
 -   Los Workers se conservan en el registro y se marcan `offline` en
     lugar de borrarse por desconexiones.
 -   `nodes` almacena Workers de cómputo, no DB Nodes.
+-   `cluster_leadership` mantiene una fila por `cluster_id`; el liderazgo
+    activo referencia un `node_id` de `nodes`.
 
 ### SQL del esquema
 
@@ -943,7 +999,12 @@ las mejoras visuales.
 5.  Conectar FastAPI con CockroachDB.
 6.  Implementar repositorios y operaciones esenciales.
 7.  Implementar registro y Heartbeat de Workers.
+    Estado: endpoints y cliente implementados; persistencia real
+    de esos endpoints pendiente de verificación. El lease de liderazgo
+    sí fue probado contra CockroachDB real.
 8.  Levantar tres Workers y verificar registro/estados.
+    Estado: tres procesos se ejecutaron contra un endpoint simulado;
+    integración real con FastAPI y CockroachDB pendiente de verificación.
 9.  Implementar Scheduler y cola básica de tareas.
 10. Probar caída/reconexión de un Worker.
 11. Verificar comportamiento ante caída de un nodo de DB.
@@ -974,6 +1035,10 @@ las mejoras visuales.
 ## 11. Criterios de aceptación del proyecto
 
 Distributed ML se considera una demo funcional cuando se logre:
+
+Esta lista representa criterios objetivo del proyecto. No se deben
+interpretar como evidencia de que los elementos estén implementados o
+validados actualmente.
 
 -   [ ] CockroachDB está funcionando como un único clúster de tres
     nodos.
@@ -1018,16 +1083,22 @@ Distributed ML se considera una demo funcional cuando se logre:
 6.  **Worker recovery limitado:** se reintentan tareas incompletas
     mientras existan Workers disponibles, pero no se garantiza
     recuperación de cualquier escenario.
-7.  **Coordinator como punto central:** si FastAPI/Coordinator cae, el
-    entrenamiento no continúa de forma autónoma. No se implementa alta
-    disponibilidad del Coordinator.
+7.  **Coordinator central en el estado actual:** si FastAPI cae, el
+    cliente Worker actual no puede registrar ni enviar Heartbeats y no
+    hay coordinación autónoma. El lease persistente ya está
+    implementado, pero no la elección automática, la puntuación de
+    capacidad ni el descubrimiento; estos siguen propuestos en
+    [docs/distributed-coordination-architecture.md](docs/distributed-coordination-architecture.md),
+    y no habilitan por sí solos el failover.
 8.  **Sin checkpointing de entrenamiento:** si el Coordinator o host se
     reinicia, el Job en curso no se reanuda desde el último modelo
     guardado.
 9.  **Datos en disco local:** CockroachDB replica metadatos, pero no los
     CSV del almacenamiento local.
-10. **Heartbeats imperfectos:** congestión o pausas pueden provocar
-    falsos positivos de desconexión; timeout requiere calibración.
+10. **Heartbeats básicos:** el Worker envía una señal periódica, pero no
+    hay detector de expiración ni transición automática a `offline`.
+    En la arquitectura futura, congestión o pausas pueden causar falsos
+    positivos; el lease/timeout debe calibrarse.
 11. **Resultados repetidos:** la protección de duplicados será lógica,
     basada en identificadores y estado; no se promete ejecución
     exactly-once.
