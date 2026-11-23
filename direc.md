@@ -1,44 +1,49 @@
-# Corrección acotada: Liberación del liderazgo durante el apagado del Worker
+# Directriz 9: Implementar Scheduler y cola básica de tareas
 
-Realiza una corrección exclusivamente sobre la liberación del lease durante el apagado ordenado de un Worker.
+## Objetivo
+
+Implementar el Scheduler y una cola básica de tareas para el proyecto, integrándolos con la arquitectura distribuida actual y el mecanismo de liderazgo ya implementado.
 
 ## Fuentes de información
 
-Consulta únicamente el código existente y el README.md del proyecto.
+Consulta exclusivamente:
 
-Identifica las operaciones de liderazgo ya implementadas en el repositorio y el ciclo de vida actual de `WorkerCoordination`.
+- El código fuente existente en el repositorio.
+- El `README.md` ubicado en la raíz del proyecto.
 
-## Cambio solicitado
+Identifica allí la estructura, los componentes existentes, los contratos, el modelo de datos y las responsabilidades de cada módulo antes de realizar cambios.
 
-En `WorkerCoordination.stop()`:
+## Alcance de implementación
 
-1. Comprueba si el Worker es actualmente el propietario del liderazgo.
-2. Si es líder, intenta liberar el lease utilizando exclusivamente la operación `release_leadership` ya implementada en el repositorio.
-3. Utiliza el identificador del Worker y la época correspondiente al liderazgo adquirido.
-4. Si el Worker no es líder, no debe intentar liberar ningún lease.
-5. Si la liberación falla, registra el error y continúa con el apagado normal del servicio. La expiración del lease debe seguir funcionando como mecanismo de respaldo.
-6. Conserva el orden de apagado necesario para evitar que el Worker siga prestando el servicio de coordinación después de iniciar su retirada del liderazgo.
+Implementa únicamente lo necesario para cumplir la tarea:
 
-## Restricciones
+**9. Implementar Scheduler y cola básica de tareas.**
 
-- Modifica exclusivamente `coordination.py`, salvo que una dependencia directa haga indispensable un cambio mínimo en `worker.py`.
-- No modifiques el mecanismo de adquisición, renovación o validación del lease.
-- No modifiques la publicación de heartbeat ni métricas.
-- No cambies el algoritmo actual de elección del líder.
-- No introduzcas criterios nuevos de selección de candidatos.
-- No intentes resolver las colisiones de puertos en esta corrección.
-- No modifiques el esquema, no ejecutes DDL y no alteres CockroachDB.
-- No modifiques el README ni otros documentos.
-- No agregues dependencias.
-- No ejecutes pruebas, compilaciones ni comandos Git.
+La implementación debe integrarse con la arquitectura y los mecanismos existentes, respetando las responsabilidades actuales de los componentes y evitando duplicar funcionalidades ya implementadas.
 
-Si la implementación actual no permite liberar el lease de forma segura utilizando las operaciones existentes, informa el impedimento sin crear mecanismos alternativos.
+## Limitaciones obligatorias
+
+- Modifica exclusivamente archivos de código necesarios para implementar esta tarea.
+- No modifiques el README.md ni ningún otro documento.
+- No modifiques el esquema de CockroachDB ni crees o ejecutes DDL.
+- No alteres los datos existentes en la base de datos.
+- No modifiques Docker Compose, la infraestructura ni la configuración del entorno.
+- No reemplaces ni alteres los mecanismos existentes de registro, heartbeat, publicación de métricas, coordinación, elección, adquisición, renovación, validación o liberación del liderazgo.
+- No implementes funcionalidades correspondientes a subtareas posteriores.
+- No agregues dependencias ni tecnologías nuevas innecesarias.
+- No realices refactorizaciones ajenas al alcance.
+- No ejecutes pruebas, compilaciones, comandos Git ni operaciones de infraestructura.
+
+Si encuentras que algún requisito indispensable no puede cumplirse con la estructura, los contratos o las capacidades existentes, informa el impedimento sin ampliar el alcance ni improvisar cambios fuera de las restricciones establecidas.
 
 ## Informe final
 
-Indica:
-- Archivos modificados.
-- Comportamiento de apagado anterior y nuevo.
-- Cómo se evita liberar el lease de otro Worker.
-- Qué ocurre si falla la liberación.
-- Confirmación de que no se modificaron otros mecanismos ni la base de datos.
+Al terminar, informa brevemente:
+
+- Archivos de código modificados.
+- Funcionalidad del Scheduler implementada.
+- Funcionamiento de la cola básica de tareas.
+- Integración con los mecanismos existentes.
+- Limitaciones o impedimentos encontrados.
+
+No realices ninguna modificación adicional fuera del alcance de esta directriz.
