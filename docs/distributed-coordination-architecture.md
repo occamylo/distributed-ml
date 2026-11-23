@@ -1,7 +1,8 @@
 # Arquitectura objetivo de coordinación distribuida
 
-**Estado:** lease persistente implementado; elección automática y
-coordinación distribuida siguen pendientes.  
+**Estado:** lease persistente y publicación directa de Heartbeat/métricas
+implementados; elección automática y coordinación distribuida siguen
+pendientes.
 **Alcance:** elección segura de coordinador, selección por capacidad,
 comunicación y recuperación. Las secciones identifican qué primitivas
 ya existen y cuáles siguen siendo propuestas.
@@ -22,10 +23,10 @@ Asumir el rol interno de coordinador no equivale por sí solo a reemplazar
 la API pública ni a garantizar que la interfaz pueda enviar nuevas
 solicitudes.
 
-La tabla de liderazgo y las operaciones transaccionales básicas ya se
-implementaron como fundamento. Esta entrega no ejecuta una elección
-automática, no selecciona candidatos por capacidad ni cambia el
-comportamiento del Worker.
+La tabla de liderazgo, las operaciones transaccionales básicas y la
+publicación directa de Heartbeat/métricas ya están implementadas como
+fundamento. Esta entrega no ejecuta una elección automática ni selecciona
+candidatos por capacidad.
 
 ## 2. Estado actual verificado en el código
 
@@ -38,14 +39,17 @@ comportamiento del Worker.
   `status='online'` y, mediante `repository.update_node`, actualiza
   `updated_at`.
 - `backend/workers/worker.py` es un cliente Python invocable. Al arrancar
-  obtiene hostname, IP y recursos básicos, se registra contra la URL de
-  FastAPI recibida por parámetro y conserva el UUID en memoria. Envía un
-  Heartbeat cada 3 segundos por defecto. No ejecuta tareas, no aloja una
-  API de coordinación ni tiene reintentos ante la caída del Backend.
-- El Worker actual reporta núcleos lógicos y RAM total al registrarse;
-  no reporta CPU/RAM disponibles ni carga de tareas en cada Heartbeat.
-  Los Heartbeats no provocan detección de expiración ni cambian
-  automáticamente el estado a `offline`.
+  obtiene hostname, IP y capacidad total, se registra contra la URL de
+  FastAPI recibida por parámetro y conserva el UUID en memoria. Después
+  inicializa su propio pool de CockroachDB y publica Heartbeat y métricas
+  cada 3 segundos por defecto. Si la DB no está disponible, conserva el
+  proceso y reintenta con el pool existente. No ejecuta tareas ni aloja
+  una API de coordinación.
+- El Worker mide CPU y RAM disponibles mediante el sistema operativo;
+  informa `active_tasks=0` porque no hay ejecutor. Un valor que no se
+  pueda medir de forma fiable queda en `NULL`. Los Heartbeats no provocan
+  detección de expiración ni cambian automáticamente el estado a
+  `offline`.
 - `backend/database/migrations/001_create_cluster_leadership.sql`
   crea aditivamente la tabla de lease y la fila inicial `default`.
 - `repository.py` dispone de operaciones para las cinco tablas de
@@ -58,16 +62,16 @@ comportamiento del Worker.
   propagan. La validación independiente no está integrada aún en las
   futuras mutaciones de Jobs/Tasks como fencing.
 - Los módulos de Scheduler y entrenamiento aún no implementan esas
-  responsabilidades. El cliente Worker depende actualmente de FastAPI
-  para registro y Heartbeat.
+  responsabilidades. FastAPI es necesario para el registro inicial; las
+  publicaciones posteriores del Worker no dependen de FastAPI.
 - La versión y el DDL desplegado se comprobaron en CockroachDB
-  v26.2.2: las cinco tablas existentes coinciden con el DDL de
-  `README.md`, y la nueva tabla de liderazgo se creó con la migración.
+  v26.2.2: las cinco tablas originales, la tabla de liderazgo y las
+  cuatro columnas métricas de `nodes` se verificaron en el clúster real.
   No se verificaron el factor de replicación efectivo ni el quórum.
 
-Por tanto, el estado `online` solo significa que un Heartbeat reciente
-fue aceptado por el endpoint actual; no acredita que el Worker pueda
-coordinar o ejecutar tareas.
+Por tanto, el estado `online` significa que el Worker publicó
+recientemente a CockroachDB; no acredita que pueda coordinar o ejecutar
+tareas.
 
 ## 3. Componentes propuestos
 
@@ -92,22 +96,19 @@ instalación de varios hosts no puede usarse `127.0.0.1` como dirección
 del coordinador. En la demo local, los procesos necesitarán puertos
 distintos aunque compartan el mismo host.
 
-Para que el clúster pueda operar si FastAPI cae, el registro y las
-actualizaciones de Heartbeat/recursos de los Workers también deberán
-poder persistirse directamente usando la base compartida. Esto requiere
-inicializar un pool en cada Worker o extraer la capa de persistencia a
-un módulo compartido. El endpoint HTTP actual puede mantenerse para
-clientes externos, pero no puede ser el único camino de registro o
-Heartbeat en la arquitectura objetivo.
+El registro inicial continúa usando `POST /nodes`. Una vez obtenido el
+`node_id`, cada Worker inicializa un pool propio y escribe Heartbeat y
+métricas directamente en CockroachDB. Así, la caída posterior de FastAPI
+no interrumpe esas publicaciones. El endpoint HTTP de Heartbeat se
+conserva para clientes externos, pero no lo usa el proceso Worker.
 
 ## 4. Métricas, elegibilidad y selección por capacidad
 
 ### 4.1 Señales
 
-Los valores actuales `nodes.cpu_cores` y `nodes.ram_mb` representan
-capacidad reportada al iniciar el proceso. No miden recursos disponibles
-ni límites efectivos del contenedor. La propuesta requiere reportar
-periódicamente:
+Los valores `nodes.cpu_cores` y `nodes.ram_mb` representan capacidad
+total reportada al iniciar el proceso. El Worker ahora publica
+periódicamente estos campos de disponibilidad:
 
 - CPU total y CPU disponible, expresadas en núcleos efectivos.
 - RAM total y RAM disponible, en MB.
@@ -116,19 +117,19 @@ periódicamente:
 - Marca temporal de medición y URL anunciada del Worker.
 - Estado operativo y último Heartbeat.
 
-El Worker puede obtener CPU disponible con muestras de contadores del
-sistema operativo en una ventana de varios segundos, ajustadas a la
-cuota de CPU del contenedor. En Linux se deben considerar los contadores
-del sistema y límites cgroup; en Windows, contadores del sistema
-operativo. La RAM disponible debe venir de la API/métrica de memoria del
-SO y estar limitada por cgroup cuando aplique. La disponibilidad de
-Tasks proviene del ejecutor local, no del SO.
+CPU disponible se estima con una muestra de contadores del sistema
+operativo (Windows o Linux); en Linux la capacidad se limita a la cuota
+cgroup cuando está disponible. RAM disponible viene de las métricas del
+SO y se limita a memoria cgroup cuando está disponible. En otros sistemas
+se usa la carga promedio si está soportada; si no, se guarda `NULL`.
+Estas son estimaciones a nivel de sistema, no consumo exclusivo del
+proceso Worker. La disponibilidad de Tasks proviene del ejecutor local,
+no del SO; actualmente se informa cero.
 
-Como punto inicial, enviar una muestra cada 3 segundos, junto al
-Heartbeat, y considerar obsoletos Heartbeat o métricas con más de 10
-segundos. Son valores configurables para la primera implementación, no
-garantías temporales. El estado actual solo reporta capacidad total y
-cada Heartbeat pasa por FastAPI.
+El Worker publica una muestra cada 3 segundos por defecto, junto al
+Heartbeat. Considerar obsoletos Heartbeat o métricas con más de 10
+segundos es un umbral de diseño futuro; aún no existe un monitor que
+marque nodos `offline`.
 
 ### 4.2 Elegibilidad
 
@@ -379,34 +380,33 @@ del almacenamiento o del Docker Engine puede afectar a todos. Esta
 topología no demuestra tolerancia a fallos físicos; se requieren hosts,
 red y dominios de fallo independientes.
 
-## 9. Cambios de persistencia propuestos (no aplicados)
+## 9. Estado del esquema y cambios futuros
 
-La tabla `cluster_leadership` ya está implementada. Los siguientes
-cambios siguen siendo propuestas y no se aplicaron:
+`cluster_leadership` y las columnas métricas
+`nodes.cpu_available_cores`, `nodes.ram_available_mb`,
+`nodes.active_tasks` y `nodes.metrics_updated_at` ya están implementadas.
+Los siguientes cambios siguen siendo propuestas y no se aplicaron:
 
-1. **`nodes`:** conservar `cpu_cores` y `ram_mb` como capacidad total;
-   añadir disponibilidad dinámica (`cpu_available_cores`,
-   `ram_available_mb`, `active_tasks`, `metrics_updated_at`) y
-   `coordination_url`.
+1. **`nodes`:** añadir `coordination_url` para el endpoint interno futuro.
 2. **`tasks`:** conservar `attempts`, `node_id` y restricciones actuales;
    añadir `attempt_id`, `lease_until` y `leader_epoch`. Evaluar un índice
    por estado/vencimiento para recuperar Tasks expiradas.
-3. **Identidad del intento:** una tabla histórica de intentos solo es
-   necesaria si se requiere auditoría detallada; no es requisito para el
-   primer MVP con un token vigente en `tasks`.
+3. **`task_attempts` opcional:** solo si se requiere historial detallado;
+   no es requisito para el MVP con el token vigente en `tasks`. El DDL
+   objetivo se describe en el README y no está aplicado.
 
-Antes de definir migraciones debe verificarse el DDL desplegado, las
-versiones de CockroachDB, las políticas de transacción/reintento y el
-modelo de permisos. Ninguna de estas propuestas está implementada.
+Antes de implementar estas propuestas debe verificarse el DDL desplegado,
+las versiones de CockroachDB, las políticas de transacción/reintento y el
+modelo de permisos. Ninguna de ellas está implementada.
 
 ## 10. Diferencias y etapas futuras
 
 | Área | Estado actual | Objetivo propuesto |
 |---|---|---|
-| Ingreso | FastAPI es necesario para los Workers | Ingreso estable enruta a FastAPI o al líder Worker |
+| Ingreso | FastAPI necesario para registro inicial; métricas directas a DB | Ingreso estable enruta a FastAPI o al líder Worker |
 | Coordinación | No hay Scheduler operativo; existe lease persistente | Un Worker coordina bajo el lease |
 | Elección | Primitivas acquire/renew/release/validate implementadas | Elección automática y ordenada de candidatos |
-| Capacidad | CPU/RAM total al registrar | Capacidad y disponibilidad medidas por Heartbeat |
+| Capacidad | CPU/RAM total al registrar; métricas disponibles publicadas a DB | Selección por capacidad y umbrales de elegibilidad |
 | Descubrimiento | URL de FastAPI configurada | Fila de líder + URL anunciada del Worker |
 | Recuperación | No hay reasignación operativa | Leases de Tasks, intentos y actualizaciones idempotentes |
 | Fallos físicos | Procesos locales en un host | Requiere hosts y dominios de fallo independientes |
@@ -415,19 +415,17 @@ Orden sugerido de implementación:
 
 1. Verificar DDL/réplicas reales y acordar topología, direcciones,
    permisos DB y límites de recursos.
-2. Definir/migrar métricas y URL de Worker; probar su frescura y
-   obtención desde el SO.
-3. Implementar reporte periódico de métricas OS y Heartbeat directo a
-   CockroachDB, sin depender de FastAPI.
-4. Implementar el servidor HTTP interno del Worker, descubrimiento del
+2. Definir/migrar la URL interna del Worker y los campos de leases de
+   Tasks; validar permisos y política de reintentos.
+3. Implementar el servidor HTTP interno del Worker, descubrimiento del
    líder y cambio de destino por época.
-5. Implementar elección automática por capacidad, ventanas de fallback
+4. Implementar elección automática por capacidad, ventanas de fallback
    y fencing de todas las mutaciones usando las primitivas ya disponibles.
-6. Implementar asignación y leases de Tasks, fencing de intentos,
+5. Implementar asignación y leases de Tasks, fencing de intentos,
    reintentos limitados y agregación idempotente.
-7. Implementar FastAPI como proxy y un gateway externo redundante para
+6. Implementar FastAPI como proxy y un gateway externo redundante para
    la continuidad de la API pública.
-8. Probar caídas de procesos, pérdida de un nodo DB, particiones de red
+7. Probar caídas de procesos, pérdida de un nodo DB, particiones de red
    y persistencia real; luego repetir en hosts físicos independientes.
 
 ## 11. Migración y pruebas de liderazgo

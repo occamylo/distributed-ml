@@ -25,6 +25,10 @@ _NODE_UPDATE_FIELDS = (
     "cpu_cores",
     "ram_mb",
     "last_heartbeat",
+    "cpu_available_cores",
+    "ram_available_mb",
+    "active_tasks",
+    "metrics_updated_at",
 )
 _JOB_UPDATE_FIELDS = (
     "dataset_id",
@@ -296,6 +300,21 @@ def update_node(node_id: UUID, fields: Mapping[str, Any]) -> Record | None:
         fields,
         _NODE_UPDATE_FIELDS,
         touch_updated_at=True,
+    )
+
+
+def update_node_metrics(
+    node_id: UUID,
+    cpu_available_cores: float | None,
+    ram_available_mb: int | None,
+    active_tasks: int,
+) -> Record | None:
+    return _fetch_one(
+        "UPDATE nodes SET status = %s, last_heartbeat = now(), "
+        "cpu_available_cores = %s, ram_available_mb = %s, "
+        "active_tasks = %s, metrics_updated_at = now(), updated_at = now() "
+        "WHERE node_id = %s RETURNING *",
+        ("online", cpu_available_cores, ram_available_mb, active_tasks, node_id),
     )
 
 
