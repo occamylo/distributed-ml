@@ -90,6 +90,21 @@ def _run_leadership_transaction(operation: Callable[[Any], _T]) -> _T:
     raise RuntimeError("Leadership transaction exhausted without a result.")
 
 
+def _lock_current_leadership(
+    cursor: Any,
+    leader_node_id: UUID,
+    leader_epoch: int,
+    cluster_id: str,
+) -> bool:
+    cursor.execute(
+        "SELECT cluster_id FROM cluster_leadership "
+        "WHERE cluster_id = %s AND leader_node_id = %s AND epoch = %s "
+        "AND lease_until > now() FOR UPDATE",
+        (cluster_id, leader_node_id, leader_epoch),
+    )
+    return cursor.fetchone() is not None
+
+
 def _lease_duration(seconds: float) -> timedelta:
     if not math.isfinite(seconds) or seconds <= 0:
         raise ValueError("Lease duration must be a finite value greater than zero.")
@@ -420,21 +435,31 @@ def create_task(
     started_at: datetime | None = None,
     completed_at: datetime | None = None,
     error_message: str | None = None,
-) -> Record:
-    return _insert(
-        "tasks",
-        {
-            "job_id": job_id,
-            "node_id": node_id,
-            "partition_index": partition_index,
-            "rows_assigned": rows_assigned,
-            "status": status,
-            "attempts": attempts,
-            "started_at": started_at,
-            "completed_at": completed_at,
-            "error_message": error_message,
-        },
+    *,
+    leader_node_id: UUID,
+    leader_epoch: int,
+    cluster_id: str = DEFAULT_CLUSTER_ID,
+) -> Record | None:
+    if (
+        node_id is not None
+        or status != "pending"
+        or attempts != 0
+        or started_at is not None
+        or completed_at is not None
+        or error_message is not None
+    ):
+        raise ValueError("Tasks must be created pending and unassigned.")
+
+    created_tasks = create_tasks_for_job(
+        job_id,
+        [{"partition_index": partition_index, "rows_assigned": rows_assigned}],
+        leader_node_id,
+        leader_epoch,
+        cluster_id,
     )
+    if created_tasks is None:
+        return None
+    return created_tasks[0]
 
 
 def get_task(task_id: UUID) -> Record | None:
@@ -450,7 +475,124 @@ def list_tasks_by_job(job_id: UUID) -> list[Record]:
     )
 
 
+def list_pending_tasks_by_job(job_id: UUID) -> list[Record]:
+    return _fetch_all(
+        "SELECT * FROM tasks "
+        "WHERE job_id = %s AND status = 'pending' AND node_id IS NULL "
+        "ORDER BY partition_index ASC, task_id ASC",
+        (job_id,),
+    )
+
+
+def create_tasks_for_job(
+    job_id: UUID,
+    partitions: Sequence[Mapping[str, int | None]],
+    leader_node_id: UUID,
+    leader_epoch: int,
+    cluster_id: str = DEFAULT_CLUSTER_ID,
+) -> list[Record] | None:
+    normalized_partitions: list[tuple[int, int | None]] = []
+    seen_partition_indexes: set[int] = set()
+    for partition in partitions:
+        unknown_fields = set(partition).difference({"partition_index", "rows_assigned"})
+        if unknown_fields:
+            names = ", ".join(sorted(unknown_fields))
+            raise ValueError(f"Unsupported task partition field(s): {names}")
+
+        partition_index = partition.get("partition_index")
+        rows_assigned = partition.get("rows_assigned")
+        if (
+            not isinstance(partition_index, int)
+            or isinstance(partition_index, bool)
+            or partition_index < 0
+        ):
+            raise ValueError("partition_index must be a non-negative integer.")
+        if rows_assigned is not None and (
+            not isinstance(rows_assigned, int)
+            or isinstance(rows_assigned, bool)
+            or rows_assigned < 0
+        ):
+            raise ValueError("rows_assigned must be a non-negative integer or None.")
+        if partition_index in seen_partition_indexes:
+            raise ValueError(
+                f"Duplicate partition_index {partition_index} for Job {job_id}."
+            )
+        seen_partition_indexes.add(partition_index)
+        normalized_partitions.append((partition_index, rows_assigned))
+
+    if not normalized_partitions:
+        return []
+
+    def create(cursor: Any) -> list[Record] | None:
+        if not _lock_current_leadership(
+            cursor,
+            leader_node_id,
+            leader_epoch,
+            cluster_id,
+        ):
+            return None
+
+        created_tasks: list[Record] = []
+        for partition_index, rows_assigned in normalized_partitions:
+            cursor.execute(
+                "INSERT INTO tasks "
+                "(job_id, node_id, partition_index, rows_assigned, status, attempts) "
+                "VALUES (%s, NULL, %s, %s, 'pending', 0) RETURNING *",
+                (job_id, partition_index, rows_assigned),
+            )
+            task = cursor.fetchone()
+            if task is None:
+                raise RuntimeError("Task creation did not return the created row.")
+            created_tasks.append(task)
+        return created_tasks
+
+    return _run_leadership_transaction(create)
+
+
+def assign_task(
+    task_id: UUID,
+    worker_node_id: UUID,
+    leader_node_id: UUID,
+    leader_epoch: int,
+    task_lease_duration_seconds: float,
+    cluster_id: str = DEFAULT_CLUSTER_ID,
+) -> Record | None:
+    duration = _lease_duration(task_lease_duration_seconds)
+
+    def assign(cursor: Any) -> Record | None:
+        if not _lock_current_leadership(
+            cursor,
+            leader_node_id,
+            leader_epoch,
+            cluster_id,
+        ):
+            return None
+
+        cursor.execute(
+            "UPDATE tasks "
+            "SET node_id = %s, status = 'assigned', attempts = attempts + 1, "
+            "attempt_id = gen_random_uuid(), lease_until = now() + %s, "
+            "leader_epoch = %s "
+            "WHERE task_id = %s AND status = 'pending' AND node_id IS NULL "
+            "RETURNING *",
+            (worker_node_id, duration, leader_epoch, task_id),
+        )
+        return cursor.fetchone()
+
+    return _run_leadership_transaction(assign)
+
+
 def update_task(task_id: UUID, fields: Mapping[str, Any]) -> Record | None:
+    assignment_fields = {
+        "node_id",
+        "attempts",
+        "attempt_id",
+        "lease_until",
+        "leader_epoch",
+    }
+    if assignment_fields.intersection(fields) or fields.get("status") == "assigned":
+        raise ValueError("Task assignment must use assign_task.")
+
     return _update(
         "tasks",
         "task_id",

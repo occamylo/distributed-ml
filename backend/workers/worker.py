@@ -17,6 +17,7 @@ from psycopg import OperationalError
 from psycopg.errors import SerializationFailure
 from psycopg_pool import PoolTimeout
 
+from coordinator.scheduler import Scheduler
 from database.connection import close_pool, initialize_pool
 from database.repository import get_node, update_node_metrics
 from workers.coordination import WorkerCoordination
@@ -341,6 +342,7 @@ def run_worker(
 
     pool_initialized = False
     coordination: WorkerCoordination | None = None
+    scheduler: Scheduler | None = None
     try:
         while True:
             cycle_started = time.monotonic()
@@ -386,6 +388,8 @@ def run_worker(
                     continue
                 coordination = WorkerCoordination(UUID(node_id), advertised_host)
                 coordination.start()
+                scheduler = Scheduler(coordination)
+                scheduler.start()
 
             try:
                 cpu_available_cores = _get_cpu_available_cores()
@@ -426,6 +430,8 @@ def run_worker(
     except KeyboardInterrupt:
         logger.info("Worker %s stopped.", node_id)
     finally:
+        if scheduler is not None:
+            scheduler.stop()
         if coordination is not None:
             coordination.stop()
         close_pool()

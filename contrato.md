@@ -617,3 +617,98 @@ El Repository debe ser una capa de persistencia deliberadamente sencilla.
 Su comportamiento debe poder entenderse leyendo las funciones disponibles, sin necesitar conocer el funcionamiento interno del Coordinator, Scheduler, Workers o algoritmos de Machine Learning.
 
 **El Repository guarda, consulta, actualiza y elimina únicamente cuando está autorizado. No decide cómo funciona el sistema distribuido.**
+
+## 17. Contratos propuestos para Job, Task y Scheduler — Tarea 9.1
+
+**Estado: propuesta para revisión; no implica que estas operaciones estén implementadas.**
+
+El código actual dispone de operaciones básicas de persistencia para Jobs y Tasks. `backend/workers/coordination.py` inicia un servicio HTTP interno y un ciclo de elección/renovación/liberación mediante el lease; esto no implementa planificación de Jobs ni consumo de Tasks. `backend/coordinator/scheduler.py`, `backend/coordinator/partitioner.py` y `backend/api/jobs.py` siguen siendo marcadores. El Worker publica Heartbeat y métricas, pero no consume Tasks. El contrato de abajo define el límite mínimo para una implementación posterior, sin incluir entrenamiento ni recuperación avanzada.
+
+### 17.1. Contrato de Job
+
+Un Job representa una solicitud de procesamiento asociada a un Dataset. Para planificarlo se necesitan `job_id`, `dataset_id`, `status` y `requested_workers`. `algorithm`, `target_column`, `parameters`, `train_ratio` y `seed` describen la ejecución futura; el Scheduler los conserva, pero no los interpreta para ejecutar entrenamiento.
+
+- Solo un Job `pending` puede ser tomado para planificación.
+- `requested_workers` es el máximo de Workers distintos que se pueden asignar al Job.
+- `actual_workers` representa el número de Workers distintos que recibieron al menos una Task del Job; no se calcula a partir de Workers solicitados ni seleccionados sin asignación.
+- El Job pasa a `running` cuando se confirma la primera asignación de Task. `started_at` se establece en esa transición.
+- `completed`, `failed` y `cancelled` son estados existentes en el esquema de referencia. Sus transiciones y la relación con la agregación o cancelación no forman parte de esta tarea.
+- La política cuando hay menos Workers elegibles que `requested_workers` está pendiente. Como propuesta conservadora para revisar, el Job permanece `pending` y no se crean asignaciones parciales hasta que haya suficientes Workers. Esta política requiere aprobación antes de implementarse.
+
+Un Job debe referenciar un Dataset existente. La lectura del archivo y la determinación de sus filas o particiones no corresponden al contrato del Job.
+
+### 17.2. Contrato de Task
+
+Una Task es una unidad persistente de trabajo asociada a una partición lógica de un Job. `UNIQUE(job_id, partition_index)` identifica una sola Task por partición. `partition_index` debe respetar la restricción no negativa del esquema de referencia; `rows_assigned` expresa cuántas filas contiene la partición cuando ese dato se conoce.
+
+Estados de la tabla de referencia:
+
+| Estado | Significado propuesto |
+|---|---|
+| `pending` | Task en la cola, todavía sin Worker asignado. |
+| `assigned` | Task reservada para el Worker indicado por `node_id`. |
+| `running` | El Worker confirmó que inició el intento asignado. |
+| `completed` | El intento terminó correctamente. |
+| `failed` | El intento terminó con error; el detalle puede guardarse en `error_message`. |
+
+Transiciones mínimas propuestas: `pending → assigned → running → completed|failed`. La asignación debe establecer `node_id`, crear un `attempt_id` nuevo, incrementar `attempts` una sola vez y guardar `lease_until` y `leader_epoch`. `started_at` se establece al confirmar el inicio; `completed_at`, al terminar el intento. Los campos de intento identifican y delimitan la asignación vigente; no representan un historial de intentos.
+
+El vencimiento de `lease_until` no autoriza por sí solo a reasignar una Task en esta etapa. La política de recuperación, reintentos y transiciones desde una Task vencida queda fuera del alcance y debe definirse posteriormente. El ejecutor no debe aceptar como vigente un intento distinto del `attempt_id` asignado.
+
+### 17.3. Criterios mínimos de elegibilidad de Workers
+
+Los datos disponibles en `nodes` para planificar son `status`, `last_heartbeat`, `cpu_available_cores`, `ram_available_mb`, `active_tasks` y `metrics_updated_at`. El Worker actual publica las métricas de disponibilidad y fija `active_tasks` en cero porque aún no ejecuta Tasks.
+
+Como filtro inicial propuesto:
+
+- Excluir nodos cuyo `status` sea `offline`.
+- Exigir Heartbeat y métricas recientes. El umbral inicial de 10 segundos aparece en la documentación arquitectónica como criterio futuro; debe confirmarse antes de implementarlo.
+- Exigir métricas de CPU y RAM disponibles distintas de `NULL`; los valores totales no sustituyen a los disponibles.
+- Usar `active_tasks` como señal de carga, no como límite de concurrencia: el modelo no define capacidad máxima de Tasks por Worker.
+
+No se establece aquí un umbral de CPU/RAM para ejecutar Tasks ni una regla adicional para `busy`, porque el código y el README no fijan esos límites para el Scheduler. Deben decidirse antes de la implementación. La selección final nunca puede superar `requested_workers`. No se define un algoritmo de puntuación o balanceo avanzado en esta tarea.
+
+### 17.4. Responsabilidades y comunicación del Scheduler
+
+El Scheduler es la lógica del Worker que posee el lease vigente. Su alcance mínimo propuesto es:
+
+1. Consultar Jobs `pending` y los registros de Workers.
+2. Filtrar Workers con los criterios aprobados y seleccionar como máximo `requested_workers`.
+3. Obtener una descripción de particiones de un Partitioner y crear Tasks persistentes.
+4. Asignar Tasks a Workers y actualizar `actual_workers` y el estado del Job de forma consistente.
+5. Detener nuevas operaciones de planificación si pierde la autoridad.
+
+El flujo de comunicación propuesto usa CockroachDB como fuente compartida: la API (cuando se implemente) crea un Job `pending`; el Scheduler líder consulta Jobs y Workers; las asignaciones se persisten en `tasks`; el Worker ejecutor consulta o recibe las Tasks asignadas a su `node_id` y reporta su progreso mediante el contrato de intento. La elección del protocolo de consulta/entrega y reconocimiento del Worker sigue pendiente: el código actual no tiene un consumidor de Tasks ni una ruta interna para ello.
+
+Responsabilidades:
+
+- **API:** aceptar solicitudes de Job y persistirlas; no elegir Workers ni asignar Tasks.
+- **Scheduler líder:** aplicar la política de elegibilidad, planificar y solicitar las mutaciones persistentes necesarias.
+- **Repository:** ejecutar consultas y mutaciones atómicas parametrizadas; no seleccionar Workers ni decidir estados de negocio.
+- **Worker ejecutor:** atender únicamente la asignación que le corresponde y reportar el intento vigente. La ejecución del algoritmo y la agregación quedan fuera de esta tarea.
+- **Liderazgo:** el Worker coordinador debe operar con el `node_id` y `epoch` vigentes, y dejar de iniciar planificación al perderlos. La propiedad local `is_leader` no sustituye la validación persistente.
+
+### 17.5. Persistencia y protección contra concurrencia
+
+Las operaciones existentes `create_task`, `list_tasks_by_job`, `update_task`, `list_jobs`, `list_nodes` y `validate_leadership` permiten persistencia y consulta básicas, pero no bastan para implementar una cola distribuida segura:
+
+- No hay consulta específica y ordenada de Jobs `pending`.
+- `create_task` no recibe `attempt_id`, `lease_until` ni `leader_epoch`.
+- `update_task` actualiza por `task_id`; no reclama condicionalmente una Task que siga `pending` ni admite los campos de asignación anteriores.
+- No existe una operación atómica para que un solo Worker reclame una Task pendiente.
+- No existe una mutación de Job y Tasks que las confirme conjuntamente.
+- `validate_leadership` ejecutada por separado de una mutación de cola deja una carrera: el lease puede cambiar entre la validación y la escritura.
+
+La siguiente implementación deberá definir operaciones de Repository para consultar Jobs pendientes, crear el conjunto inicial de Tasks, reclamar una Task pendiente y actualizarla solo si coinciden su estado esperado y el intento vigente. Las mutaciones críticas deben validar `cluster_id`, propietario y `epoch` dentro de la misma transacción que modifica la cola; una comprobación separada no constituye fencing suficiente. La transacción debe también respetar `UNIQUE(job_id, partition_index)` y evitar que dos consumidores asignen la misma Task.
+
+### 17.6. Discrepancias y decisiones previas a la tarea 9.2
+
+- **Correspondencia del esquema:** el DDL de referencia del README incluye `attempt_id`, `lease_until` y `leader_epoch`, pero no se debe asumir que existen en la base física. `schema.sql` no contiene el esquema integral y las funciones actuales del Repository no leen ni escriben esos campos. Antes de usarlos debe confirmarse el esquema desplegado; cualquier migración requiere una decisión separada.
+- **Estado documental de liderazgo:** el código actual inicia elección desde el Worker, mientras que el README todavía describe la elección automática y la comunicación Worker-a-Worker como pendientes. Esta sección distingue la capacidad de liderazgo existente de las capacidades de Scheduler/cola aún no implementadas.
+- **Particionado:** `partitioner.py` no implementa generación de particiones. Falta definir el número de Tasks por Job, cómo se distribuyen las filas y cómo puede el Worker reconstruir el segmento a partir de `partition_index` y `rows_assigned`, sin añadir campos por suposición.
+- **Workers insuficientes:** debe aprobarse si un Job espera a reunir `requested_workers` o puede ejecutarse con menos; la propuesta conservadora está en 17.1.
+- **Disponibilidad y capacidad:** deben definirse el umbral de vigencia, la política para `busy`, los mínimos de CPU/RAM y el máximo de Tasks concurrentes por Worker.
+- **Entrega al ejecutor:** debe definirse el mecanismo de consulta, asignación y reconocimiento de Tasks. Actualmente el Worker solo publica Heartbeat/métricas.
+- **Fencing del Repository:** se necesitan operaciones transaccionales que combinen validación del liderazgo y mutación de la cola; las funciones existentes no ofrecen esa atomicidad.
+
+Hasta resolver estos puntos, el Scheduler y la cola descritos en esta sección son contratos propuestos, no capacidades implementadas.

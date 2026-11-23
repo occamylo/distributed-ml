@@ -1,49 +1,27 @@
-# Directriz 9: Implementar Scheduler y cola básica de tareas
+Revisa exclusivamente la estructura actual del proyecto y el README para determinar cómo se debe ejecutar correctamente un Worker desde Git Bash.
 
-## Objetivo
+El comando documentado:
 
-Implementar el Scheduler y una cola básica de tareas para el proyecto, integrándolos con la arquitectura distribuida actual y el mecanismo de liderazgo ya implementado.
+`python -m workers.worker --backend-url http://127.0.0.1:8000`
 
-## Fuentes de información
+está fallando con:
 
-Consulta exclusivamente:
+`ModuleNotFoundError: No module named 'workers'`
 
-- El código fuente existente en el repositorio.
-- El `README.md` ubicado en la raíz del proyecto.
+Necesito que determines:
 
-Identifica allí la estructura, los componentes existentes, los contratos, el modelo de datos y las responsabilidades de cada módulo antes de realizar cambios.
+1. La ubicación real del módulo o script del Worker.
+2. Desde qué directorio debe ejecutarse.
+3. El comando exacto de Bash para iniciarlo utilizando el entorno virtual existente.
+4. Si requiere alguna variable de entorno, dependencia, servicio o condición previa.
+5. El procedimiento exacto para levantar un Worker adicional, si queremos simular varios nodos.
 
-## Alcance de implementación
+**Restricciones:**
 
-Implementa únicamente lo necesario para cumplir la tarea:
+- No modifiques ningún archivo.
+- No ejecutes el Worker, backend, Docker, pruebas ni comandos que alteren el estado del sistema.
+- No instales dependencias.
+- No propongas cambios arquitectónicos ni refactorizaciones.
+- Limítate a revisar el código existente y el README para dar instrucciones de ejecución correctas.
 
-**9. Implementar Scheduler y cola básica de tareas.**
-
-La implementación debe integrarse con la arquitectura y los mecanismos existentes, respetando las responsabilidades actuales de los componentes y evitando duplicar funcionalidades ya implementadas.
-
-## Limitaciones obligatorias
-
-- Modifica exclusivamente archivos de código necesarios para implementar esta tarea.
-- No modifiques el README.md ni ningún otro documento.
-- No modifiques el esquema de CockroachDB ni crees o ejecutes DDL.
-- No alteres los datos existentes en la base de datos.
-- No modifiques Docker Compose, la infraestructura ni la configuración del entorno.
-- No reemplaces ni alteres los mecanismos existentes de registro, heartbeat, publicación de métricas, coordinación, elección, adquisición, renovación, validación o liberación del liderazgo.
-- No implementes funcionalidades correspondientes a subtareas posteriores.
-- No agregues dependencias ni tecnologías nuevas innecesarias.
-- No realices refactorizaciones ajenas al alcance.
-- No ejecutes pruebas, compilaciones, comandos Git ni operaciones de infraestructura.
-
-Si encuentras que algún requisito indispensable no puede cumplirse con la estructura, los contratos o las capacidades existentes, informa el impedimento sin ampliar el alcance ni improvisar cambios fuera de las restricciones establecidas.
-
-## Informe final
-
-Al terminar, informa brevemente:
-
-- Archivos de código modificados.
-- Funcionalidad del Scheduler implementada.
-- Funcionamiento de la cola básica de tareas.
-- Integración con los mecanismos existentes.
-- Limitaciones o impedimentos encontrados.
-
-No realices ninguna modificación adicional fuera del alcance de esta directriz.
+Entrega únicamente los comandos exactos que debo ejecutar y, brevemente, el orden en el que debo hacerlo para iniciar y verificar un Worker.
