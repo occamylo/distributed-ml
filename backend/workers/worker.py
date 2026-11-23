@@ -11,7 +11,7 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from psycopg import OperationalError
 from psycopg.errors import SerializationFailure
@@ -311,28 +311,62 @@ def _post_json(url: str, payload: dict[str, Any] | None = None) -> dict[str, Any
     return result
 
 
-def _register_worker(backend_url: str) -> str:
+def _load_or_create_node_id(node_id_file: Path) -> UUID:
+    node_id_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with node_id_file.open("x", encoding="ascii") as identity_file:
+            node_id = uuid4()
+            identity_file.write(f"{node_id}\n")
+            return node_id
+    except FileExistsError:
+        pass
+
+    try:
+        return UUID(node_id_file.read_text(encoding="ascii").strip())
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Worker identity file {node_id_file} must contain a valid UUID."
+        ) from exc
+
+
+def _register_worker(
+    backend_url: str,
+    node_id_file: Path | None = None,
+) -> str:
+    registration_payload: dict[str, Any] = {
+        "hostname": socket.gethostname(),
+        "ip_address": _get_ip_address(),
+        "cpu_cores": os.cpu_count(),
+        "ram_mb": _get_ram_mb(),
+    }
+    expected_node_id = None
+    if node_id_file is not None:
+        expected_node_id = _load_or_create_node_id(node_id_file)
+        registration_payload["node_id"] = str(expected_node_id)
+
     registration = _post_json(
         f"{backend_url}/nodes",
-        {
-            "hostname": socket.gethostname(),
-            "ip_address": _get_ip_address(),
-            "cpu_cores": os.cpu_count(),
-            "ram_mb": _get_ram_mb(),
-        },
+        registration_payload,
     )
     node_id_value = registration.get("node_id")
     if not isinstance(node_id_value, str):
         raise RuntimeError("Backend registration response did not include a node_id.")
     try:
-        return str(UUID(node_id_value))
+        registered_node_id = UUID(node_id_value)
     except ValueError as exc:
         raise RuntimeError("Backend registration returned an invalid node_id.") from exc
+    if expected_node_id is not None and registered_node_id != expected_node_id:
+        raise RuntimeError(
+            "Backend registration returned a node_id different from the persisted "
+            "Worker identity."
+        )
+    return str(registered_node_id)
 
 
 def run_worker(
     backend_url: str,
     heartbeat_interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    node_id_file: Path | None = None,
 ) -> None:
     parsed_url = urlparse(backend_url)
     if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
@@ -341,7 +375,7 @@ def run_worker(
         raise ValueError("Heartbeat interval must be greater than zero.")
 
     backend_url = backend_url.rstrip("/")
-    node_id = _register_worker(backend_url)
+    node_id = _register_worker(backend_url, node_id_file)
     logger.info("Registered Worker %s as node %s.", socket.gethostname(), node_id)
 
     pool_initialized = False
@@ -472,13 +506,21 @@ def main() -> None:
         default=DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
         help="Seconds between heartbeats (default: 3).",
     )
+    parser.add_argument(
+        "--node-id-file",
+        type=Path,
+        help=(
+            "Persistent identity file for this Worker; reuse the same file when "
+            "restarting it. Each concurrent Worker needs a distinct file."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    run_worker(args.backend_url, args.heartbeat_interval)
+    run_worker(args.backend_url, args.heartbeat_interval, args.node_id_file)
 
 
 if __name__ == "__main__":

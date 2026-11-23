@@ -10,6 +10,7 @@ router = APIRouter()
 
 
 class NodeRegistration(BaseModel):
+    node_id: UUID | None = None
     hostname: str
     ip_address: str | None = None
     cpu_cores: int | None = None
@@ -24,6 +25,7 @@ def register_node(node: NodeRegistration) -> dict[str, Any]:
         status="offline",
         cpu_cores=node.cpu_cores,
         ram_mb=node.ram_mb,
+        node_id=node.node_id,
     )
 
 

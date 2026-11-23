@@ -284,18 +284,51 @@ def create_node(
     cpu_cores: int | None = None,
     ram_mb: int | None = None,
     last_heartbeat: datetime | None = None,
+    node_id: UUID | None = None,
 ) -> Record:
-    return _insert(
-        "nodes",
-        {
-            "hostname": hostname,
-            "ip_address": ip_address,
-            "status": status,
-            "cpu_cores": cpu_cores,
-            "ram_mb": ram_mb,
-            "last_heartbeat": last_heartbeat,
-        },
+    if node_id is None:
+        return _insert(
+            "nodes",
+            {
+                "hostname": hostname,
+                "ip_address": ip_address,
+                "status": status,
+                "cpu_cores": cpu_cores,
+                "ram_mb": ram_mb,
+                "last_heartbeat": last_heartbeat,
+            },
+        )
+
+    row = _fetch_one(
+        "INSERT INTO nodes "
+        "(node_id, hostname, ip_address, status, cpu_cores, ram_mb, last_heartbeat) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (node_id) DO UPDATE SET "
+        "hostname = excluded.hostname, "
+        "ip_address = excluded.ip_address, "
+        "status = excluded.status, "
+        "cpu_cores = excluded.cpu_cores, "
+        "ram_mb = excluded.ram_mb, "
+        "last_heartbeat = excluded.last_heartbeat, "
+        "cpu_available_cores = NULL, "
+        "ram_available_mb = NULL, "
+        "active_tasks = NULL, "
+        "metrics_updated_at = NULL, "
+        "updated_at = now() "
+        "RETURNING *",
+        (
+            node_id,
+            hostname,
+            ip_address,
+            status,
+            cpu_cores,
+            ram_mb,
+            last_heartbeat,
+        ),
     )
+    if row is None:
+        raise RuntimeError("Node registration did not return the registered node.")
+    return row
 
 
 def get_node(node_id: UUID) -> Record | None:
