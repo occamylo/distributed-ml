@@ -1,72 +1,44 @@
-# Directriz: Servicio interno de coordinación y elección del líder
+# Corrección acotada: Liberación del liderazgo durante el apagado del Worker
 
-Implementa la siguiente etapa del proyecto: el servicio interno de coordinación entre Workers y la elección del líder mediante el mecanismo de lease persistente que ya existe.
+Realiza una corrección exclusivamente sobre la liberación del lease durante el apagado ordenado de un Worker.
 
-## 1. Fuentes de información
+## Fuentes de información
 
-Antes de modificar cualquier archivo, revisa exclusivamente:
+Consulta únicamente el código existente y el README.md del proyecto.
 
-- El código fuente actual del proyecto.
-- El `README.md` ubicado en la raíz del proyecto.
+Identifica las operaciones de liderazgo ya implementadas en el repositorio y el ciclo de vida actual de `WorkerCoordination`.
 
-Obtén de allí la estructura, los contratos, las operaciones existentes, el modelo de datos y las capacidades que ya están implementadas.
+## Cambio solicitado
 
-No introduzcas supuestos que contradigan la implementación existente.
+En `WorkerCoordination.stop()`:
 
-## 2. Alcance de la implementación
+1. Comprueba si el Worker es actualmente el propietario del liderazgo.
+2. Si es líder, intenta liberar el lease utilizando exclusivamente la operación `release_leadership` ya implementada en el repositorio.
+3. Utiliza el identificador del Worker y la época correspondiente al liderazgo adquirido.
+4. Si el Worker no es líder, no debe intentar liberar ningún lease.
+5. Si la liberación falla, registra el error y continúa con el apagado normal del servicio. La expiración del lease debe seguir funcionando como mecanismo de respaldo.
+6. Conserva el orden de apagado necesario para evitar que el Worker siga prestando el servicio de coordinación después de iniciar su retirada del liderazgo.
 
-Implementa únicamente lo necesario para:
+## Restricciones
 
-1. Incorporar el servicio interno de comunicación y coordinación de los Workers.
-2. Permitir que los Workers conozcan y se comuniquen con el coordinador vigente.
-3. Implementar la elección del líder utilizando los mecanismos de lease persistente que ya existen en CockroachDB.
-4. Permitir que el líder mantenga su lease mientras conserve legítimamente la autoridad.
-5. Permitir que otro Worker pueda asumir el liderazgo cuando el lease vigente deje de ser válido.
-6. Evitar que un Worker continúe ejerciendo funciones de coordinación cuando haya perdido su liderazgo.
+- Modifica exclusivamente `coordination.py`, salvo que una dependencia directa haga indispensable un cambio mínimo en `worker.py`.
+- No modifiques el mecanismo de adquisición, renovación o validación del lease.
+- No modifiques la publicación de heartbeat ni métricas.
+- No cambies el algoritmo actual de elección del líder.
+- No introduzcas criterios nuevos de selección de candidatos.
+- No intentes resolver las colisiones de puertos en esta corrección.
+- No modifiques el esquema, no ejecutes DDL y no alteres CockroachDB.
+- No modifiques el README ni otros documentos.
+- No agregues dependencias.
+- No ejecutes pruebas, compilaciones ni comandos Git.
 
-La implementación debe respetar los contratos y las responsabilidades que ya existen en el proyecto.
+Si la implementación actual no permite liberar el lease de forma segura utilizando las operaciones existentes, informa el impedimento sin crear mecanismos alternativos.
 
-## 3. Separación obligatoria de responsabilidades
+## Informe final
 
-La publicación periódica de heartbeat y métricas de los Workers ya está implementada.
-
-**No confundas ni mezcles estas operaciones con la elección o el mantenimiento del liderazgo.**
-
-En particular:
-
-- Publicar métricas no concede liderazgo.
-- Tener mayor capacidad disponible no concede liderazgo.
-- Estar registrado y aparecer como `online` no concede liderazgo.
-- La autoridad para coordinar debe depender exclusivamente de la adquisición y vigencia legítima del lease.
-- La renovación del lease debe respetar las condiciones y mecanismos de autoridad existentes.
-
-No dupliques ni reemplaces la publicación de métricas para implementar la coordinación.
-
-## 4. Restricciones
-
-- Modifica exclusivamente archivos de código necesarios para este alcance.
-- No modifiques el `README.md`.
-- No modifiques el modelo de datos ni ejecutes DDL.
-- No alteres las tablas existentes ni los datos de CockroachDB.
-- No crees una implementación paralela del mecanismo de lease.
-- No reemplaces ni debilites los mecanismos de concurrencia, expiración, renovación y validación de autoridad existentes.
-- No implementes todavía asignación de tareas, entrenamiento distribuido, recuperación de tareas ni agregación de resultados.
-- No implementes un gateway redundante ni cambies el punto de entrada público de FastAPI.
-- No amplíes el alcance hacia otras etapas futuras del proyecto.
-- No agregues dependencias o componentes tecnológicos innecesarios.
-- No ejecutes pruebas, compilaciones, comandos de Git ni operaciones sobre CockroachDB.
-
-Si durante la revisión encuentras que falta algún requisito estructural indispensable que no puede resolverse exclusivamente mediante los cambios de código permitidos, no improvises una solución ni amplíes el alcance: informa el impedimento y los archivos o componentes involucrados.
-
-## 5. Resultado esperado
-
-Al finalizar, informa brevemente:
-
-- Qué archivos modificaste.
-- Qué responsabilidad implementa cada modificación.
-- Cómo se diferencia la publicación de métricas de la adquisición y renovación del liderazgo.
-- Cómo se utiliza el lease existente para determinar quién puede coordinar.
-- Qué aspectos quedan pendientes para etapas posteriores.
-- Si encontraste algún impedimento que requiera una decisión antes de continuar.
-
-No realices modificaciones adicionales fuera de esta directriz.
+Indica:
+- Archivos modificados.
+- Comportamiento de apagado anterior y nuevo.
+- Cómo se evita liberar el lease de otro Worker.
+- Qué ocurre si falla la liberación.
+- Confirmación de que no se modificaron otros mecanismos ni la base de datos.

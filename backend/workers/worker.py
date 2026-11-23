@@ -18,7 +18,8 @@ from psycopg.errors import SerializationFailure
 from psycopg_pool import PoolTimeout
 
 from database.connection import close_pool, initialize_pool
-from database.repository import update_node_metrics
+from database.repository import get_node, update_node_metrics
+from workers.coordination import WorkerCoordination
 
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 3.0
 REQUEST_TIMEOUT_SECONDS = 10
@@ -339,6 +340,7 @@ def run_worker(
     logger.info("Registered Worker %s as node %s.", socket.gethostname(), node_id)
 
     pool_initialized = False
+    coordination: WorkerCoordination | None = None
     try:
         while True:
             cycle_started = time.monotonic()
@@ -354,6 +356,36 @@ def run_worker(
                     )
                     time.sleep(heartbeat_interval_seconds)
                     continue
+
+            if coordination is None:
+                try:
+                    node = get_node(UUID(node_id))
+                except (OperationalError, PoolTimeout) as exc:
+                    logger.warning(
+                        "Worker %s could not load its coordination address (%s); "
+                        "retrying.",
+                        node_id,
+                        type(exc).__name__,
+                    )
+                    time.sleep(heartbeat_interval_seconds)
+                    continue
+                if node is None:
+                    logger.error(
+                        "Worker %s is registered, but its CockroachDB node row is missing.",
+                        node_id,
+                    )
+                    time.sleep(heartbeat_interval_seconds)
+                    continue
+                advertised_host = node["ip_address"] or node["hostname"]
+                if not isinstance(advertised_host, str) or not advertised_host:
+                    logger.error(
+                        "Worker %s has no host address for internal coordination.",
+                        node_id,
+                    )
+                    time.sleep(heartbeat_interval_seconds)
+                    continue
+                coordination = WorkerCoordination(UUID(node_id), advertised_host)
+                coordination.start()
 
             try:
                 cpu_available_cores = _get_cpu_available_cores()
@@ -394,6 +426,8 @@ def run_worker(
     except KeyboardInterrupt:
         logger.info("Worker %s stopped.", node_id)
     finally:
+        if coordination is not None:
+            coordination.stop()
         close_pool()
 
 
