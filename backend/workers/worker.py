@@ -18,6 +18,7 @@ from psycopg.errors import SerializationFailure
 from psycopg_pool import PoolTimeout
 
 from coordinator.scheduler import Scheduler
+from coordinator.training_runner import TrainingCoordinator
 from database.connection import close_pool, initialize_pool
 from database.repository import (
     get_node,
@@ -383,6 +384,7 @@ def run_worker(
     coordination: WorkerCoordination | None = None
     task_executor: TaskExecutor | None = None
     scheduler: Scheduler | None = None
+    training: TrainingCoordinator | None = None
     try:
         while True:
             cycle_started = time.monotonic()
@@ -435,6 +437,8 @@ def run_worker(
                 coordination.start()
                 scheduler = Scheduler(coordination)
                 scheduler.start()
+                training = TrainingCoordinator(coordination)
+                training.start()
 
             try:
                 stale_nodes = mark_stale_nodes_offline()
@@ -493,6 +497,8 @@ def run_worker(
     except KeyboardInterrupt:
         logger.info("Worker %s stopped.", node_id)
     finally:
+        if training is not None:
+            training.stop()
         if scheduler is not None:
             scheduler.stop()
         if coordination is not None:

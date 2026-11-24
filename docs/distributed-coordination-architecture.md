@@ -61,8 +61,11 @@ candidatos por capacidad.
   modifica una fila devuelve `None`; los errores de persistencia se
   propagan. La validación independiente no está integrada aún en las
   futuras mutaciones de Jobs/Tasks como fencing.
-- Los módulos de Scheduler y entrenamiento aún no implementan esas
-  responsabilidades. FastAPI es necesario para el registro inicial; las
+- El Worker líder ejecuta el Scheduler y el ciclo de entrenamiento
+  (`coordinator/scheduler.py` y `coordinator/training_runner.py`). Los
+  cambios de estado de Jobs y Tasks pasan por `update_job_as_leader` y
+  `update_job_tasks_as_leader`, que validan propietario y época en la
+  misma transacción (sección 5.3). FastAPI es necesario para el registro inicial; las
   publicaciones posteriores del Worker no dependen de FastAPI.
 - La versión y el DDL desplegado se comprobaron en CockroachDB
   v26.2.2: las cinco tablas originales, la tabla de liderazgo y las
@@ -318,7 +321,9 @@ es únicamente local.
 
 La selección de líder y la asignación de cómputo son decisiones
 separadas. El coordinador reserva CPU/RAM para la coordinación y no
-asigna automáticamente la mayor carga al Worker líder. Las Tasks se
+asigna automáticamente la mayor carga al Worker líder. Implementado: el
+Scheduler pone al coordinador último en la preferencia, así que solo
+participa si faltan Workers y nunca recibe más Tasks que los demás. Las Tasks se
 asignan usando los recursos libres, la carga activa y la capacidad
 concurrente de cada Worker.
 

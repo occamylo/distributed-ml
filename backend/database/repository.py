@@ -719,6 +719,53 @@ def update_task(task_id: UUID, fields: Mapping[str, Any]) -> Record | None:
     )
 
 
+_TASK_LEADER_UPDATE_FIELDS = ("status", "started_at", "completed_at", "error_message")
+
+
+def update_job_tasks_as_leader(
+    job_id: UUID,
+    expected_statuses: Sequence[str],
+    fields: Mapping[str, Any],
+    leader_node_id: UUID,
+    leader_epoch: int,
+    cluster_id: str = DEFAULT_CLUSTER_ID,
+) -> list[Record] | None:
+    """Updates the Tasks of a Job whose status is one of ``expected_statuses``.
+
+    The leadership check and the update run in the same transaction, so a
+    former coordinator cannot change Task state. Returns the updated Tasks
+    ordered by partition, or ``None`` when the caller no longer holds the
+    lease. The caller decides which transitions are valid.
+    """
+    if not expected_statuses:
+        raise ValueError("At least one expected Task status is required.")
+    if not fields:
+        raise ValueError("A leader Task update needs at least one field.")
+    unknown_fields = set(fields).difference(_TASK_LEADER_UPDATE_FIELDS)
+    if unknown_fields:
+        names = ", ".join(sorted(unknown_fields))
+        raise ValueError(f"Unsupported leader update field(s) for tasks: {names}")
+
+    assignments = [sql.SQL("{} = %s").format(sql.Identifier(column)) for column in fields]
+    query = sql.SQL(
+        "UPDATE {} SET {} WHERE {} = %s AND {} = ANY(%s) RETURNING *"
+    ).format(
+        sql.Identifier("tasks"),
+        sql.SQL(", ").join(assignments),
+        sql.Identifier("job_id"),
+        sql.Identifier("status"),
+    )
+
+    def update(cursor: Any) -> list[Record] | None:
+        if not _lock_current_leadership(cursor, leader_node_id, leader_epoch, cluster_id):
+            return None
+        cursor.execute(query, (*fields.values(), job_id, list(expected_statuses)))
+        rows = list(cursor.fetchall())
+        return sorted(rows, key=lambda row: (row["partition_index"], str(row["task_id"])))
+
+    return _run_leadership_transaction(update)
+
+
 def create_result(
     job_id: UUID,
     duration_seconds: float,

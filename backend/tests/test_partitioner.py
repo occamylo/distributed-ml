@@ -43,6 +43,13 @@ class DistributeTasksTests(unittest.TestCase):
 
         self.assertEqual(plan, [("t1", "a")])
 
+    def test_coordinator_listed_last_never_gets_more_than_the_others(self) -> None:
+        # The Scheduler lists the coordinator last; with 10 Tasks the extra
+        # one goes to another Worker.
+        plan = distribute_tasks(list(range(10)), ["w2", "w3", "lider"])
+
+        self.assertEqual(Counter(node for _, node in plan)["lider"], 3)
+
     def test_no_workers_means_no_assignments(self) -> None:
         self.assertEqual(distribute_tasks(["t1"], []), [])
 

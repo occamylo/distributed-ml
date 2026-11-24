@@ -104,7 +104,12 @@ class Scheduler:
             logger.error("Skipping Job with invalid scheduling fields: %s.", job_id)
             return True
 
-        workers = self._eligible_workers(requested_workers)
+        # The coordinator reserves CPU/RAM for coordination (architecture
+        # doc, section 7): it goes last, so it only joins a Job when no other
+        # Worker is available, and ties send extra Tasks to the others.
+        candidates = self._eligible_workers(requested_workers + 1)
+        candidates.sort(key=lambda node: node["node_id"] == self._coordination.node_id)
+        workers = candidates[:requested_workers]
         if not workers:
             logger.debug("No eligible Workers are currently available for Job %s.", job_id)
             return True

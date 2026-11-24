@@ -22,10 +22,11 @@ distribuido todavía no están implementados.
 | Carga de datasets CSV | Implementada: `POST /datasets` recibe el archivo, lo valida, lo guarda en `backend/storage/datasets/` y registra sus metadatos. |
 | Preparación de datos | Implementada: `POST /jobs` valida el target, codifica, normaliza y separa train/test estratificado antes de crear el Job. |
 | Modelo Logistic Regression (PyTorch) | Implementado: softmax binario/multiclase, gradiente por partición, agregación ponderada y evaluación; entrenamiento local de referencia. |
-| Ejecución de Tasks en Workers | Implementada para una ronda: cada Worker calcula el gradiente de su partición de train cuando el coordinador se lo pide, con verificación de `attempt_id` y época del líder. El ciclo completo de épocas todavía no está conectado. |
+| Ejecución de Tasks en Workers | Implementada: cada Worker calcula el gradiente de su partición de train cuando el coordinador se lo pide, con verificación de `attempt_id` y época del líder. |
 | Frontend | No implementado. |
 | Scheduler | Implementado en el Worker líder: elige Workers por capacidad, reparte las filas de train en más Tasks que Workers (3 por Worker) y las asigna de forma equilibrada. |
-| Ciclo de entrenamiento distribuido y recuperación de Tasks | Pendientes. |
+| Ciclo de entrenamiento distribuido | Implementado en el Worker líder: una ronda por época, agregación ponderada de gradientes, actualización de pesos y transición de Tasks y Job a `completed`. Da la misma pérdida que el entrenamiento local. |
+| Evaluación, `results` y recuperación de Tasks | Pendientes. Hoy un Worker caído durante el entrenamiento deja el Job en `failed`. |
 
 El diseño técnico de elección de coordinador, fencing, comunicación
 entre Workers y recuperación está descrito en
@@ -139,7 +140,9 @@ implementado.
    Workers**: 3 por Worker participante (9 para 3 Workers), sin superar
    el número de filas. Cada Task va al Worker participante con menos
    Tasks y, en empate, al de menor carga y más CPU/RAM, así que un Worker
-   ejecuta varias Tasks. Asigna cada Task con un `attempt_id`, un lease y
+   ejecuta varias Tasks. El Worker coordinador va último en esa
+   preferencia, porque reserva recursos para coordinar: solo participa si
+   faltan Workers y nunca recibe más Tasks que los demás. Asigna cada Task con un `attempt_id`, un lease y
    la época del líder, y pasa el Job a `running` (implementado).
 
    Las particiones pequeñas siguen el paso 7 del diseño: permiten que los
@@ -151,11 +154,15 @@ implementado.
 5. Para cada ronda, el coordinador envía los pesos actuales a cada Worker
    (`dispatcher.py`). Cada Worker comprueba que la Task es suya y del
    intento vigente, calcula el gradiente de su partición y lo devuelve
-   (implementado para una ronda).
-6. El coordinador agrega los gradientes, actualiza los pesos y repite por
-   cada época (pendiente).
+   (implementado).
+6. El coordinador de entrenamiento (`training_runner.py`, en el Worker
+   líder) pasa las Tasks a `running` con `started_at`. En cada época
+   comprueba que sigue siendo líder, envía la ronda, espera **todos** los
+   gradientes, los agrega con `Σ nᵢ·Gᵢ / Σ nᵢ` y actualiza
+   `w ← w − learning_rate · G`. Al terminar pasa Tasks y Job a
+   `completed` con `completed_at` (implementado).
 7. El coordinador evalúa con el conjunto de test y guarda el resultado en
-   `results` (pendiente).
+   `results` antes de completar el Job (pendiente).
 8. Una interfaz consultará el estado del Job y sus métricas (pendiente).
 
 #### Protocolo de una ronda
@@ -227,6 +234,7 @@ pero todavía no contiene archivos.
 │   │   ├── partitioner.py     # Reparte las filas de train en Tasks
 │   │   ├── job_data.py        # Prepara el dataset de un Job (con caché)
 │   │   ├── dispatcher.py      # Envía una ronda y recoge los gradientes
+│   │   ├── training_runner.py # Ciclo de épocas en el Worker líder
 │   │   └── aggregator.py
 │   ├── database/
 │   │   ├── connection.py
@@ -260,7 +268,9 @@ entrenamiento y `backend/api/jobs.py` lo usa al crear un Job.
 `backend/workers/training_engine.py` implementa el modelo y
 `backend/coordinator/local_training.py` el entrenamiento local de
 referencia. `coordinator/partitioner.py`, `coordinator/dispatcher.py`
-y `workers/task_executor.py` reparten y ejecutan las Tasks. Los módulos
+y `workers/task_executor.py` reparten y ejecutan las Tasks;
+`coordinator/training_runner.py` repite las rondas por época y agrega
+los gradientes. Los módulos
 de `cluster` y `training` y `coordinator/aggregator.py` son marcadores
 sin funcionalidad. `backend/database/schema.sql` es un placeholder;
 el esquema integral de referencia está en este README. La migración de
@@ -645,9 +655,21 @@ python -m unittest discover -s tests -p "test_*.py" -v
 - Los CSV se guardan en el disco local del Backend: CockroachDB replica
   sus metadatos, pero no el archivo. Si se pierde el disco del Backend,
   se pierden los CSV aunque la base de datos siga intacta.
-- El ciclo de épocas, la evaluación final y la recuperación de Tasks
-  todavía no están conectados: hoy el coordinador puede ejecutar una
-  ronda, pero ningún proceso la repite hasta completar el Job.
+- La evaluación con el conjunto de test y la tabla `results` todavía no
+  están conectadas: un Job `completed` entrenó, pero aún no guarda
+  métricas.
+- Si un Worker cae durante el entrenamiento, la ronda falla y el Job pasa
+  a `failed` con el motivo en `error_message`; el modelo nunca se
+  actualiza con gradientes incompletos. Reasignar las Tasks del Worker
+  caído es parte de la recuperación de Tasks (pendiente).
+- El contexto de cada época (pesos e historial de pérdida) vive solo en
+  la memoria del coordinador, como pide `contrato.md` §14. Si el
+  coordinador pierde el lease a mitad del entrenamiento, se detiene; el
+  siguiente coordinador vuelve a entrenar el Job desde los pesos
+  iniciales, lo que da el mismo modelo porque el proceso es determinista.
+- Con datasets pequeños, la versión distribuida es más lenta que la local
+  (en la prueba, 7.6 s contra 0.04 s para 100 épocas), por el costo de
+  comunicación de cada ronda.
 - El lease de cada Task (30 s) se fija al asignarla y no se renueva; la
   recuperación de Tasks deberá renovarlo o reasignar las vencidas.
 - Cada Worker vuelve a preparar el dataset del Job en memoria (una vez por

@@ -421,6 +421,19 @@ Reglas:
 
 El Repository no decide cuándo una tarea se asigna, ejecuta, reintenta, completa o falla.
 
+#### `update_job_tasks_as_leader(job_id, expected_statuses, fields, leader_node_id, leader_epoch)`
+
+Actualiza las Tasks de un Job cuyo estado esté en `expected_statuses`, solo si quien llama sigue siendo el líder vigente con esa época. Atiende el requisito de la sección 17.5: la validación del liderazgo y la mutación ocurren en la misma transacción.
+
+Campos permitidos: `status`, `started_at`, `completed_at`, `error_message`.
+
+Reglas:
+
+- Devuelve la lista de Tasks actualizadas, ordenada por `partition_index ASC`, `task_id ASC`; `[]` si ninguna Task tenía un estado esperado.
+- Devuelve `None` si quien llama ya no posee el lease con esa época; en ese caso no modifica nada.
+- No decide transiciones: el coordinador indica qué estados espera y qué valores escribir.
+- No asigna Workers ni toca `attempts`, `attempt_id`, `lease_until` ni `leader_epoch`; la asignación sigue siendo exclusiva de `assign_task`.
+
 #### `delete_task(task_id)`
 
 **No se implementará.**
