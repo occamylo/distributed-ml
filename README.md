@@ -20,6 +20,7 @@ distribuido todavía no están implementados.
 | Heartbeat y métricas de Workers | Implementados: cada Worker publica directamente en CockroachDB cada 3 segundos por defecto. |
 | Lease persistente de liderazgo | Tabla y operaciones de repositorio implementadas; no hay elección automática. |
 | Carga de datasets CSV | Implementada: `POST /datasets` recibe el archivo, lo valida, lo guarda en `backend/storage/datasets/` y registra sus metadatos. |
+| Preparación de datos | Implementada: `POST /jobs` valida el target, codifica, normaliza y separa train/test estratificado antes de crear el Job. |
 | Frontend | No implementado. |
 | Scheduler, ejecución ML distribuida y recuperación de Tasks | Objetivos arquitectónicos; todavía no son flujos operativos. |
 
@@ -124,8 +125,10 @@ están expuestos por los módulos actuales.
 1. El usuario carga un CSV con `POST /datasets`. La API lo valida, lo
    guarda en el disco local del Backend y registra sus metadatos en
    `datasets` (implementado).
-2. El usuario configura un Job; la API prevista registrará parámetros,
-   algoritmo, columna objetivo y cantidad de Workers en `jobs`.
+2. El usuario crea un Job con `POST /jobs`. La API prepara el dataset
+   (valida el target, codifica, normaliza y separa train/test) y, si
+   todo es válido, registra parámetros, algoritmo, columna objetivo y
+   cantidad de Workers en `jobs` (implementado).
 3. El coordinador preparará particiones y creará Tasks en `tasks`.
 4. La membresía y las métricas disponibles estarán en `nodes`. Un
    Scheduler futuro elegirá Workers; actualmente no existe esa selección.
@@ -175,6 +178,7 @@ pero todavía no contiene archivos.
 │   │   └── training.py
 │   ├── coordinator/
 │   │   ├── scheduler.py
+│   │   ├── preprocessing.py   # Target, codificación, normalización y split
 │   │   ├── partitioner.py
 │   │   └── aggregator.py
 │   ├── database/
@@ -186,7 +190,8 @@ pero todavía no contiene archivos.
 │   ├── storage/
 │   │   └── datasets/
 │   ├── tests/
-│   │   └── test_leadership_repository.py
+│   │   ├── test_leadership_repository.py
+│   │   └── test_preprocessing.py
 │   └── workers/
 │       ├── worker.py
 │       └── training_engine.py
@@ -199,7 +204,8 @@ pero todavía no contiene archivos.
 `backend/api/nodes.py` implementa el registro y el endpoint HTTP de
 Heartbeat. `backend/api/datasets.py` implementa la carga y gestión de
 CSV, apoyado en `backend/dataset_storage.py` para el manejo de archivos.
-Los módulos de `cluster` y `training`, `coordinator/partitioner.py`,
+`backend/coordinator/preprocessing.py` prepara los datos para el
+entrenamiento y `backend/api/jobs.py` lo usa al crear un Job. Los módulos de `cluster` y `training`, `coordinator/partitioner.py`,
 `coordinator/aggregator.py` y `workers/training_engine.py` son
 marcadores sin funcionalidad. `backend/database/schema.sql` es un placeholder;
 el esquema integral de referencia está en este README. La migración de
@@ -450,6 +456,9 @@ Endpoints disponibles:
 | `GET /datasets/{dataset_id}` | Devuelve los metadatos de un dataset. |
 | `GET /datasets/{dataset_id}/columns` | Lee el encabezado del archivo, para elegir la columna objetivo. Responde 409 si el archivo no está en este host. |
 | `DELETE /datasets/{dataset_id}` | Borra el registro y el archivo. Responde 409 si algún Job usa el dataset. |
+| `POST /jobs` | Crea un Job `pending`. Antes de crearlo prepara el dataset completo (ver abajo) y responde 422 si no sirve para entrenar. Devuelve el Job y un resumen `preparation` con columnas, clases y filas de train/test. |
+| `GET /jobs/{job_id}` | Devuelve un Job. |
+| `GET /jobs/{job_id}/tasks` | Devuelve las Tasks que el Scheduler creó para el Job. |
 
 Reglas de validación de los CSV:
 
@@ -463,6 +472,21 @@ Reglas de validación de los CSV:
 Los tipos de datos, los valores faltantes y la columna objetivo se
 validan al preparar el entrenamiento, no al subir el archivo. Un archivo
 rechazado no queda guardado en disco.
+
+Preparación de datos (`backend/coordinator/preprocessing.py`), que se
+ejecuta al crear un Job:
+
+| Paso | Regla |
+|---|---|
+| Algoritmo | Solo `logistic_regression` (valor por defecto). |
+| Columna objetivo | Debe existir y tener entre 2 y 20 clases, con al menos 2 filas por clase. Sirve para clasificación binaria y multiclase. |
+| Valores faltantes | Se rechaza el dataset si hay celdas vacías o con `NA`, `N/A`, `NaN`, `null`, `None` o `?`; el error dice en qué columnas. |
+| Columnas numéricas | Se normalizan (z-score) con la media y la desviación del conjunto de entrenamiento. Una columna constante queda en 0. |
+| Columnas de texto | Se codifican en one-hot con las categorías vistas en entrenamiento (máximo 50). Una columna con más valores distintos se rechaza por parecer un identificador. |
+| División train/test | Estratificada por clase, con `train_ratio` (por defecto 0.8) y `seed` (por defecto 42). La misma combinación produce siempre la misma división. |
+
+El conjunto de prueba nunca participa en el cálculo de estadísticas ni de
+categorías, para que no haya fuga de información hacia el entrenamiento.
 
 Subir un CSV desde PowerShell:
 
