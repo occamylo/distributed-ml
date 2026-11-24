@@ -1,10 +1,16 @@
 """Sends one training round to the Workers and collects their gradients.
 
 For every Task of the Job, the Coordinator posts the current global weights
-to the Worker that owns it, in parallel. A round succeeds only when every
-Task returns a valid gradient for the same weights: the model must never be
-updated with an incomplete set of gradients. Failed Tasks are reported
-together so the caller can retry or reassign them.
+to the Worker that owns it, in parallel. The model must never be updated
+with an incomplete set of gradients, so ``dispatch_round`` returns the valid
+gradients together with the failed Tasks: the caller keeps the valid ones and
+retries or reassigns only the failed Tasks, with the same weights and epoch
+(README, step 10).
+
+Each failure says whether it is ``retryable``: an unreachable Worker, a
+timeout or a 5xx answer may be solved by another Worker; a rejected request
+(4xx, for example an attempt that is no longer current) or an invalid answer
+is not.
 """
 
 import json
@@ -39,6 +45,13 @@ class TaskFailure:
     task_id: UUID
     node_id: UUID | None
     reason: str
+    retryable: bool
+
+
+@dataclass(frozen=True)
+class RoundResult:
+    gradients: dict[UUID, TaskGradient]
+    failures: list[TaskFailure]
 
 
 class RoundFailedError(Exception):
@@ -58,7 +71,27 @@ def request_gradients(
     training_epoch: int,
     timeout_seconds: float = GRADIENT_REQUEST_TIMEOUT_SECONDS,
 ) -> list[TaskGradient]:
-    """Returns one gradient per Task, ordered by partition_index."""
+    """Returns one gradient per Task, ordered by partition_index.
+
+    Raises ``RoundFailedError`` if any Task fails.
+    """
+    result = dispatch_round(
+        tasks, nodes_by_id, parameters, leader_epoch, training_epoch, timeout_seconds
+    )
+    if result.failures:
+        raise RoundFailedError(result.failures)
+    return sorted(result.gradients.values(), key=lambda gradient: gradient.partition_index)
+
+
+def dispatch_round(
+    tasks: Sequence[Record],
+    nodes_by_id: Mapping[UUID, Record],
+    parameters: ModelParameters,
+    leader_epoch: int,
+    training_epoch: int,
+    timeout_seconds: float = GRADIENT_REQUEST_TIMEOUT_SECONDS,
+) -> RoundResult:
+    """Sends the round to every Task and returns valid gradients and failures."""
     if not tasks:
         raise ValueError("A training round needs at least one Task.")
 
@@ -75,10 +108,10 @@ def request_gradients(
             )
         )
 
-    failures = [outcome for outcome in outcomes if isinstance(outcome, TaskFailure)]
-    if failures:
-        raise RoundFailedError(failures)
-    return sorted(outcomes, key=lambda result: result.partition_index)
+    return RoundResult(
+        gradients={o.task_id: o for o in outcomes if isinstance(o, TaskGradient)},
+        failures=[o for o in outcomes if isinstance(o, TaskFailure)],
+    )
 
 
 def _request_one(
@@ -92,7 +125,7 @@ def _request_one(
     node = nodes_by_id.get(node_id) if isinstance(node_id, UUID) else None
     base_url = internal_base_url(node) if node is not None else None
     if base_url is None:
-        return TaskFailure(task_id, node_id, "The Task has no reachable Worker.")
+        return TaskFailure(task_id, node_id, "The Task has no reachable Worker.", True)
 
     request = Request(
         f"{base_url}/internal/tasks/{task_id}/gradient",
@@ -104,14 +137,18 @@ def _request_one(
         with urlopen(request, timeout=timeout_seconds) as response:
             payload = json.loads(response.read())
     except HTTPError as exc:
-        return TaskFailure(task_id, node_id, f"HTTP {exc.code}: {_error_detail(exc)}")
+        return TaskFailure(
+            task_id, node_id, f"HTTP {exc.code}: {_error_detail(exc)}", exc.code >= 500
+        )
     except (URLError, OSError, ValueError) as exc:
-        return TaskFailure(task_id, node_id, f"{type(exc).__name__}: {exc}")
+        # Connection refused or reset, timeout, truncated answer: the Worker
+        # may be down, so another Worker can take the Task.
+        return TaskFailure(task_id, node_id, f"{type(exc).__name__}: {exc}", True)
 
     try:
         return _validated(payload, task, body["training_epoch"])
     except (KeyError, TypeError, ValueError) as exc:
-        return TaskFailure(task_id, node_id, f"Invalid response ({exc}).")
+        return TaskFailure(task_id, node_id, f"Invalid response ({exc}).", False)
 
 
 def _validated(payload: Any, task: Record, training_epoch: int) -> TaskGradient:

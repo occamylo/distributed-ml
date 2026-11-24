@@ -17,8 +17,11 @@ the leader and its epoch in the same transaction. If this Worker loses the
 lease mid-training it stops; the next coordinator restarts the Job from
 the initial weights, which is deterministic and gives the same model.
 
-Not yet here: recovery of failed Tasks (Tarea 18). Until then a failed
-round fails the Job.
+If a Task fails, the gradients that did arrive are kept and only the failed
+Tasks are retried in the same epoch, with the same weights: the coordinator
+waits for the failed Worker's Heartbeat to expire, marks it offline and
+reassigns its Tasks to the survivors as new attempts (``recovery.py``). After
+the retry limit, or without Workers alive, the Job fails.
 """
 
 import logging
@@ -33,17 +36,23 @@ from psycopg import Error as PsycopgError
 from psycopg_pool import PoolTimeout
 
 from coordinator.aggregator import aggregate_gradients, apply_update
-from coordinator.dispatcher import RoundFailedError, request_gradients
+from coordinator.dispatcher import TaskFailure, TaskGradient, dispatch_round
 from coordinator.job_data import PreparedDatasetCache
 from coordinator.preprocessing import DatasetPreparationError, PreparedDataset
+from coordinator.recovery import MAX_TASK_ATTEMPTS, RecoveryError, plan_reassignments
+from coordinator.scheduler import TASK_LEASE_DURATION_SECONDS
 from database.repository import (
     DEFAULT_CLUSTER_ID,
+    WORKER_STALE_AFTER_SECONDS,
     complete_job_as_leader,
     get_job,
     get_leadership,
     list_jobs,
     list_nodes,
+    list_nodes_with_fresh_metrics,
     list_tasks_by_job,
+    mark_stale_nodes_offline,
+    reassign_task_as_leader,
     update_job_as_leader,
     update_job_tasks_as_leader,
 )
@@ -61,6 +70,8 @@ from workers.training_engine import (
 DEFAULT_RUNNER_INTERVAL_SECONDS = 1.0
 LOG_EVERY_EPOCHS = 10
 MAX_LOSS_HISTORY_POINTS = 200
+# Extra seconds after the Heartbeat timeout before a silent Worker counts as down.
+DETECTION_MARGIN_SECONDS = 3.0
 logger = logging.getLogger(__name__)
 Record = dict[str, Any]
 
@@ -115,6 +126,14 @@ class LeadershipLost(Exception):
     """This Worker is no longer the coordinator at the epoch it started with."""
 
 
+class TrainingStopped(Exception):
+    """The Worker process is shutting down."""
+
+
+def _describe_failures(failures: list[TaskFailure]) -> str:
+    return "; ".join(f"Task {f.task_id} on Worker {f.node_id}: {f.reason}" for f in failures)[:800]
+
+
 class TrainingCoordinator:
     def __init__(
         self,
@@ -148,6 +167,8 @@ class TrainingCoordinator:
         while not self._stop_event.is_set():
             try:
                 self._train_next_job()
+            except TrainingStopped:
+                return
             except LeadershipLost:
                 logger.warning(
                     "Worker %s stopped training because it lost the coordinator lease.",
@@ -223,22 +244,12 @@ class TrainingCoordinator:
                 logger.info("Job %s is no longer running; training stopped.", job_id)
                 return
 
-            # Tasks are re-read every epoch so a reassignment (Tarea 18)
-            # takes effect in the next round.
-            tasks = list_tasks_by_job(job_id)
-            nodes_by_id = {node["node_id"]: node for node in list_nodes()}
-            try:
-                results = request_gradients(
-                    tasks, nodes_by_id, weights, leader_epoch, training_epoch
-                )
-            except RoundFailedError as exc:
-                self._ensure_leadership(leader_epoch)
-                self._fail_job(
-                    job_id,
-                    leader_epoch,
-                    f"Training epoch {training_epoch} could not collect every gradient: {exc}",
-                )
+            collected = self._collect_epoch_gradients(
+                job_id, leader_epoch, weights, training_epoch
+            )
+            if collected is None:
                 return
+            results, tasks = collected
 
             gradient = aggregate_gradients([result.gradient for result in results])
             weights = apply_update(weights, gradient, learning_rate)
@@ -268,6 +279,155 @@ class TrainingCoordinator:
                 duration_seconds=time.perf_counter() - started,
             ),
         )
+
+    def _collect_epoch_gradients(
+        self,
+        job_id: UUID,
+        leader_epoch: int,
+        weights: ModelParameters,
+        training_epoch: int,
+    ) -> tuple[list[TaskGradient], list[Record]] | None:
+        """Returns one valid gradient per Task, recovering failed Tasks.
+
+        Valid gradients are kept; only the failed Tasks are retried, on the
+        surviving Workers, with the same weights and training epoch
+        (README, step 10). Returns ``None`` after failing the Job when the
+        failure cannot be recovered.
+        """
+        tasks = list_tasks_by_job(job_id)
+        collected: dict[UUID, TaskGradient] = {}
+        pending = tasks
+        while True:
+            nodes_by_id = {node["node_id"]: node for node in list_nodes()}
+            outcome = dispatch_round(pending, nodes_by_id, weights, leader_epoch, training_epoch)
+            # One accepted gradient per logical Task: a retried Task keeps
+            # its task_id, so it can never be counted twice.
+            collected.update(outcome.gradients)
+            if not outcome.failures:
+                tasks = list_tasks_by_job(job_id)
+                return [collected[task["task_id"]] for task in tasks], tasks
+
+            self._ensure_leadership(leader_epoch)
+            fatal = [failure for failure in outcome.failures if not failure.retryable]
+            if fatal:
+                self._fail_job(
+                    job_id,
+                    leader_epoch,
+                    f"Training epoch {training_epoch} had a non-recoverable Task failure: "
+                    + _describe_failures(fatal),
+                )
+                return None
+            try:
+                pending = self._recover_tasks(
+                    job_id, leader_epoch, outcome.failures, training_epoch
+                )
+            except RecoveryError as exc:
+                self._fail_job(
+                    job_id,
+                    leader_epoch,
+                    f"Training epoch {training_epoch} could not recover its Tasks: {exc} "
+                    f"Last failures: {_describe_failures(outcome.failures)}",
+                )
+                return None
+
+    def _recover_tasks(
+        self,
+        job_id: UUID,
+        leader_epoch: int,
+        failures: list[TaskFailure],
+        training_epoch: int,
+    ) -> list[Record]:
+        """Confirms the failed Workers are down and reassigns their Tasks."""
+        failed_nodes = {failure.node_id for failure in failures}
+        logger.warning(
+            "Job %s epoch %s: %s Task(s) failed on Worker(s) %s; waiting for their "
+            "Heartbeats to expire before reassigning.",
+            job_id,
+            training_epoch,
+            len(failures),
+            ", ".join(str(node) for node in failed_nodes),
+        )
+
+        # Detection follows the Heartbeat timeout (README step 10, architecture
+        # §8.A): a Worker that keeps publishing gets the rest of the window to
+        # recover; after it, its Tasks are reassigned anyway.
+        deadline = time.monotonic() + WORKER_STALE_AFTER_SECONDS + DETECTION_MARGIN_SECONDS
+        while True:
+            self._ensure_leadership(leader_epoch)
+            alive_nodes = self._alive_nodes()
+            if not failed_nodes & {node["node_id"] for node in alive_nodes}:
+                break
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "Worker(s) %s still publish Heartbeats but do not answer; reassigning.",
+                    ", ".join(str(node) for node in failed_nodes),
+                )
+                break
+            if self._stop_event.wait(1.0):
+                raise TrainingStopped()
+
+        marked = mark_stale_nodes_offline()
+        if marked:
+            logger.warning(
+                "Marked offline: %s.", ", ".join(str(node["node_id"]) for node in marked)
+            )
+
+        job_tasks = list_tasks_by_job(job_id)
+        by_id = {task["task_id"]: task for task in job_tasks}
+        failed_tasks = [by_id[failure.task_id] for failure in failures]
+        alive_ids = [
+            node["node_id"] for node in alive_nodes if node["node_id"] not in failed_nodes
+        ]
+        plan = plan_reassignments(
+            failed_tasks, job_tasks, alive_ids, self._coordination.node_id
+        )
+
+        reassigned: list[Record] = []
+        for task, node_id in plan:
+            updated = reassign_task_as_leader(
+                task["task_id"],
+                task["attempt_id"],
+                node_id,
+                self._coordination.node_id,
+                leader_epoch,
+                TASK_LEASE_DURATION_SECONDS,
+                DEFAULT_CLUSTER_ID,
+            )
+            if updated is None:
+                self._ensure_leadership(leader_epoch)
+                raise RecoveryError(
+                    f"Partition {task['partition_index']} changed while it was being reassigned."
+                )
+            logger.warning(
+                "Job %s: partition %s reassigned from Worker %s to Worker %s "
+                "(attempt %s of %s).",
+                job_id,
+                task["partition_index"],
+                task["node_id"],
+                node_id,
+                updated["attempts"],
+                MAX_TASK_ATTEMPTS,
+            )
+            reassigned.append(updated)
+        return reassigned
+
+    @staticmethod
+    def _alive_nodes() -> list[Record]:
+        """Online Workers with a fresh Heartbeat, in the Scheduler's order."""
+        alive = [
+            node
+            for node in list_nodes_with_fresh_metrics()
+            if node.get("status") in ("online", "busy")
+        ]
+        alive.sort(
+            key=lambda node: (
+                node.get("active_tasks") or 0,
+                -(node.get("cpu_available_cores") or 0),
+                -(node.get("ram_available_mb") or 0),
+                str(node["node_id"]),
+            )
+        )
+        return alive
 
     def _complete_job(
         self,

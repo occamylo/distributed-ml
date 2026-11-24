@@ -343,9 +343,15 @@ Como diseño objetivo:
    final única de `results` no sustituye la idempotencia por intento.
 
 Esto ofrece procesamiento al menos una vez con aceptación idempotente,
-no una garantía general de ejecución exactly-once. Las reglas de
-reintento, límite de intentos y resultados parciales deben definirse
-antes de implementar el Scheduler.
+no una garantía general de ejecución exactly-once.
+
+**Implementado (Tarea 18).** Las reasignaciones usan
+`reassign_task_as_leader`, que valida líder y época, el intento vigente y
+el estado en la misma transacción. Cada Task admite 3 intentos (el
+primero y 2 reintentos). Dentro de una ronda, los gradientes válidos se
+conservan y solo se reintentan las Tasks fallidas, con los mismos pesos y
+la misma época. La reasignación no se dispara por el vencimiento del
+lease de la Task, sino por la falla observada y confirmada por Heartbeat.
 
 ## 8. Escenarios de fallo
 
@@ -356,6 +362,12 @@ nodo `offline` y deja expirar los leases de sus Tasks. Reasigna solo los
 intentos recuperables; el token del intento evita que una respuesta
 tardía sobrescriba al intento vigente.
 
+**Implementado y probado:** al fallar las Tasks de un Worker en una
+ronda, el coordinador espera a que su Heartbeat venza (unos 8 s en la
+prueba), lo marca `offline` y reparte sus Tasks entre los Workers vivos
+como intento 2. El Job terminó con el mismo resultado que el
+entrenamiento local.
+
 ### B — Falla el Worker coordinador
 
 Los Workers siguen leyendo CockroachDB. Al vencer el lease calculan la
@@ -363,6 +375,12 @@ clasificación compartida y adquieren el siguiente lease mediante la
 actualización condicional. Después publican la nueva época y URL. La
 operación continúa cuando hay quórum de DB, al menos un Worker elegible
 y comunicación con los nodos ejecutores.
+
+**Implementado y probado:** tras matar al líder, otro Worker adquirió el
+lease 10 s después con una época nueva, retomó el Job desde los pesos
+iniciales (no hay checkpoint) y, en su primera ronda, reasignó las Tasks
+del líder caído. El Job terminó con el mismo resultado que el
+entrenamiento local.
 
 ### C — Regresa el coordinador anterior
 

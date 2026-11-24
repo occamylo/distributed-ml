@@ -719,6 +719,42 @@ def update_task(task_id: UUID, fields: Mapping[str, Any]) -> Record | None:
     )
 
 
+def reassign_task_as_leader(
+    task_id: UUID,
+    expected_attempt_id: UUID,
+    worker_node_id: UUID,
+    leader_node_id: UUID,
+    leader_epoch: int,
+    task_lease_duration_seconds: float,
+    cluster_id: str = DEFAULT_CLUSTER_ID,
+) -> Record | None:
+    """Gives a Task in progress to another Worker as a new attempt.
+
+    Only applies if the Task is still on ``expected_attempt_id`` and is
+    ``assigned`` or ``running``, and only for the current leader and epoch,
+    checked in the same transaction. It increments ``attempts`` and creates a
+    new ``attempt_id``, lease and ``leader_epoch``, so the replaced attempt
+    can no longer deliver a result. Returns the updated Task or ``None``.
+    The caller decides when a Task must be reassigned and to whom.
+    """
+    duration = _lease_duration(task_lease_duration_seconds)
+
+    def reassign(cursor: Any) -> Record | None:
+        if not _lock_current_leadership(cursor, leader_node_id, leader_epoch, cluster_id):
+            return None
+        cursor.execute(
+            "UPDATE tasks "
+            "SET node_id = %s, attempts = attempts + 1, attempt_id = gen_random_uuid(), "
+            "lease_until = now() + %s, leader_epoch = %s "
+            "WHERE task_id = %s AND attempt_id = %s AND status IN ('assigned', 'running') "
+            "RETURNING *",
+            (worker_node_id, duration, leader_epoch, task_id, expected_attempt_id),
+        )
+        return cursor.fetchone()
+
+    return _run_leadership_transaction(reassign)
+
+
 _TASK_LEADER_UPDATE_FIELDS = ("status", "started_at", "completed_at", "error_message")
 
 

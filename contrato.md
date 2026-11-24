@@ -421,6 +421,18 @@ Reglas:
 
 El Repository no decide cuándo una tarea se asigna, ejecuta, reintenta, completa o falla.
 
+#### `reassign_task_as_leader(task_id, expected_attempt_id, worker_node_id, leader_node_id, leader_epoch, task_lease_duration_seconds)`
+
+Entrega una Task en curso a otro Worker como un intento nuevo, solo si quien llama sigue siendo el líder vigente con esa época, validado en la misma transacción (sección 17.5).
+
+Reglas:
+
+- Solo modifica la Task si sigue en `expected_attempt_id` y su estado es `assigned` o `running`.
+- Establece el nuevo `node_id`, incrementa `attempts` una vez, crea un `attempt_id` nuevo y fija `lease_until` y `leader_epoch`. El intento anterior deja de ser válido.
+- Conserva el estado de la Task.
+- Devuelve la Task actualizada, o `None` si quien llama ya no posee el lease o si la Task ya no está en ese intento.
+- No decide cuándo ni a quién reasignar: eso lo decide el coordinador.
+
 #### `update_job_tasks_as_leader(job_id, expected_statuses, fields, leader_node_id, leader_epoch)`
 
 Actualiza las Tasks de un Job cuyo estado esté en `expected_statuses`, solo si quien llama sigue siendo el líder vigente con esa época. Atiende el requisito de la sección 17.5: la validación del liderazgo y la mutación ocurren en la misma transacción.
@@ -683,7 +695,7 @@ Estados de la tabla de referencia:
 
 Transiciones mínimas propuestas: `pending → assigned → running → completed|failed`. La asignación debe establecer `node_id`, crear un `attempt_id` nuevo, incrementar `attempts` una sola vez y guardar `lease_until` y `leader_epoch`. `started_at` se establece al confirmar el inicio; `completed_at`, al terminar el intento. Los campos de intento identifican y delimitan la asignación vigente; no representan un historial de intentos.
 
-El vencimiento de `lease_until` no autoriza por sí solo a reasignar una Task en esta etapa. La política de recuperación, reintentos y transiciones desde una Task vencida queda fuera del alcance y debe definirse posteriormente. El ejecutor no debe aceptar como vigente un intento distinto del `attempt_id` asignado.
+El vencimiento de `lease_until` no autoriza por sí solo a reasignar una Task. **Política de recuperación implementada (Tarea 18):** el coordinador reasigna una Task cuando su ejecución falla de forma recuperable (Worker inalcanzable, timeout o 5xx) y la caída del Worker se confirma porque su Heartbeat vence, o porque sigue sin responder al terminar ese plazo. Cada Task admite 3 intentos (la asignación inicial y 2 reintentos); al agotarlos, o sin Workers vivos, el Job pasa a `failed`. Una Task reasignada conserva su estado `running`. El ejecutor no debe aceptar como vigente un intento distinto del `attempt_id` asignado.
 
 ### 17.3. Criterios mínimos de elegibilidad de Workers
 

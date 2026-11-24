@@ -27,7 +27,7 @@ distribuido todavía no están implementados.
 | Scheduler | Implementado en el Worker líder: elige Workers por capacidad, reparte las filas de train en más Tasks que Workers (3 por Worker) y las asigna de forma equilibrada. |
 | Ciclo de entrenamiento distribuido | Implementado en el Worker líder: una ronda por época, agregación ponderada de gradientes, actualización de pesos y transición de Tasks y Job a `completed`. Da la misma pérdida que el entrenamiento local. |
 | Evaluación y resultados | Implementados: el coordinador evalúa con el conjunto de test y, en una sola transacción, completa Tasks y Job y guarda el resultado; `GET /jobs/{job_id}/result` lo devuelve. |
-| Recuperación de Tasks | Pendiente. Hoy un Worker caído durante el entrenamiento deja el Job en `failed`. |
+| Recuperación de Tasks | Implementada: si un Worker cae durante el entrenamiento, el coordinador confirma la caída por Heartbeat, lo marca `offline` y reasigna sus Tasks a los sobrevivientes dentro de la misma época, con hasta 3 intentos por Task. Probado al caer un Worker y al caer el líder: el Job termina con el mismo resultado que el entrenamiento local. |
 
 El diseño técnico de elección de coordinador, fencing, comunicación
 entre Workers y recuperación está descrito en
@@ -169,7 +169,49 @@ implementado.
    verificación de líder pasa Tasks y Job a `completed` y guarda la fila
    única de `results`: o se guardan los tres cambios o ninguno
    (implementado).
-8. Una interfaz consultará el estado del Job y sus métricas (pendiente).
+8. Si una Task falla durante una ronda, el coordinador conserva los
+   gradientes que sí llegaron y recupera solo las Tasks fallidas, dentro
+   de la misma época y con los mismos pesos (implementado, ver
+   "Recuperación de Tasks").
+9. Una interfaz consultará el estado del Job y sus métricas (pendiente).
+
+#### Recuperación de Tasks
+
+Sigue el paso 10 del diseño y la sección 8 de
+`docs/distributed-coordination-architecture.md`:
+
+1. **Clasificar la falla.** Un Worker inalcanzable, un timeout o una
+   respuesta 5xx se pueden recuperar. Un rechazo (4xx, por ejemplo un
+   `attempt_id` que ya no es el vigente) o una respuesta inválida hacen
+   fallar el Job.
+2. **Confirmar la caída por Heartbeat.** El coordinador espera a que el
+   Heartbeat del Worker venza (10 s, más 3 s de margen) antes de
+   reasignar. Si el Worker sigue publicando pero no responde, sus Tasks se
+   reasignan igual al terminar ese plazo. Después marca `offline` a los
+   Workers vencidos.
+3. **Reasignar.** `recovery.py` reparte las Tasks fallidas entre los
+   Workers vivos que ya participan en el Job, al que tenga menos Tasks y
+   con el coordinador al final; solo si no queda ninguno puede usar otro
+   Worker en línea. Cada reasignación es un intento nuevo
+   (`reassign_task_as_leader`: `attempts + 1`, `attempt_id` nuevo, lease y
+   época del líder), así que el intento anterior ya no puede entregar
+   resultados.
+4. **Repetir la ronda solo para esas Tasks**, con los mismos pesos y la
+   misma época. Cada Task lógica aporta un único gradiente.
+5. **Límite.** Una Task puede ejecutarse 3 veces (la primera y 2
+   reintentos, el valor inicial del diseño). Si se agotan o no quedan
+   Workers vivos, el Job pasa a `failed` con el motivo.
+
+Si cae el coordinador, otro Worker adquiere el lease al vencer (10 s),
+retoma el Job desde los pesos iniciales y, en su primera ronda, recupera
+las Tasks del coordinador caído con el mismo procedimiento.
+
+Prueba con 3 Workers, 9 Tasks y 600 épocas:
+
+| Caída | Qué pasó | Resultado |
+|---|---|---|
+| Un Worker que no es líder, en la época 47 | 8 s de detección; sus 3 Tasks pasan a los otros 2 (intento 2) | `completed`, mismo accuracy y loss que el entrenamiento local |
+| El líder | Otro Worker toma el lease 10 s después, retoma el Job y reasigna las 3 Tasks del líder | `completed`, mismo resultado que el local |
 
 #### Protocolo de una ronda
 
@@ -241,6 +283,7 @@ pero todavía no contiene archivos.
 │   │   ├── job_data.py        # Prepara el dataset de un Job (con caché)
 │   │   ├── dispatcher.py      # Envía una ronda y recoge los gradientes
 │   │   ├── training_runner.py # Ciclo de épocas, evaluación y resultado
+│   │   ├── recovery.py        # Reasignación de Tasks de un Worker caído
 │   │   └── aggregator.py      # Promedio ponderado y actualización de pesos
 │   ├── database/
 │   │   ├── connection.py
@@ -252,6 +295,7 @@ pero todavía no contiene archivos.
 │   │   ├── test_leadership_repository.py
 │   │   ├── test_partitioner.py
 │   │   ├── test_preprocessing.py
+│   │   ├── test_recovery.py
 │   │   └── test_training_engine.py
 │   └── workers/
 │       ├── worker.py
@@ -277,7 +321,8 @@ gradientes (promedio ponderado y actualización de pesos), y
 referencia. `coordinator/partitioner.py`, `coordinator/dispatcher.py`
 y `workers/task_executor.py` reparten y ejecutan las Tasks;
 `coordinator/training_runner.py` repite las rondas por época, evalúa y
-guarda el resultado. `api/cluster.py` y `api/training.py` quedan como
+guarda el resultado, y `coordinator/recovery.py` decide a qué Worker
+va cada Task de un Worker caído. `api/cluster.py` y `api/training.py` quedan como
 marcadores para las vistas del frontend. `backend/database/schema.sql`
 contiene el esquema completo que se aplica en una instalación nueva,
 incluida la tabla `cluster_leadership` y su fila `default`.
@@ -681,10 +726,13 @@ python -m unittest discover -s tests -p "test_*.py" -v
   núcleos disponibles y quedan fuera durante ese ciclo, lo que solo
   retrasa el arranque. Los umbrales de CPU/RAM siguen pendientes de
   decisión (`contrato.md` §17.6).
-- Si un Worker cae durante el entrenamiento, la ronda falla y el Job pasa
-  a `failed` con el motivo en `error_message`; el modelo nunca se
-  actualiza con gradientes incompletos. Reasignar las Tasks del Worker
-  caído es parte de la recuperación de Tasks (pendiente).
+- La caída de un Worker pausa el entrenamiento unos 10–13 s mientras se
+  confirma por Heartbeat. El modelo nunca se actualiza con gradientes
+  incompletos. Se procesa al menos una vez con aceptación idempotente, no
+  exactly-once.
+- La recuperación no cubre la pérdida de todos los Workers ni la del
+  host; tampoco hay checkpoint, así que un nuevo coordinador reentrena el
+  Job desde el principio.
 - El contexto de cada época (pesos e historial de pérdida) vive solo en
   la memoria del coordinador, como pide `contrato.md` §14. Si el
   coordinador pierde el lease a mitad del entrenamiento, se detiene; el
@@ -693,8 +741,10 @@ python -m unittest discover -s tests -p "test_*.py" -v
 - Con datasets pequeños, la versión distribuida es más lenta que la local
   (en la prueba, 7.6 s contra 0.04 s para 100 épocas), por el costo de
   comunicación de cada ronda.
-- El lease de cada Task (30 s) se fija al asignarla y no se renueva; la
-  recuperación de Tasks deberá renovarlo o reasignar las vencidas.
+- El lease de cada Task (30 s) se fija al asignarla o reasignarla y no se
+  renueva en cada época. La reasignación se basa en la falla observada y
+  confirmada por Heartbeat, no en el vencimiento del lease
+  (`contrato.md` §17.2).
 - Cada Worker vuelve a preparar el dataset del Job en memoria (una vez por
   Job). Con datasets grandes, los tres procesos ocupan esa memoria a la vez
   en el mismo host.
