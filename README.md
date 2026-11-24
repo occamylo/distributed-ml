@@ -15,7 +15,7 @@ distribuido todavía no están implementados.
 
 | Capacidad | Estado |
 |---|---|
-| Clúster local CockroachDB de tres nodos | Definido en Docker Compose; la replicación efectiva y el quórum no están verificados. |
+| Clúster local CockroachDB de tres nodos | Verificado: un solo clúster, `num_replicas = 3` y cada rango con réplicas en los tres nodos. La app sigue funcionando si cae cualquier nodo y responde con errores claros si se pierde el quórum. |
 | Registro inicial de Workers | Implementado con `POST /nodes`. |
 | Heartbeat y métricas de Workers | Implementados: cada Worker publica directamente en CockroachDB cada 3 segundos por defecto. |
 | Lease persistente de liderazgo | Tabla y operaciones de repositorio implementadas; no hay elección automática. |
@@ -365,11 +365,13 @@ docker exec distributed-ml-db1 cockroach sql --insecure --database=defaultdb --e
 docker compose ps
 ```
 
-Después, abrir una sesión SQL y pegar el único bloque DDL de la sección
-Modelo de datos:
+Después, aplicar el esquema copiando `schema.sql` al contenedor. No
+pasarlo por stdin desde PowerShell: antepone un BOM y CockroachDB
+responde `syntax error`.
 
 ```powershell
-docker exec -it distributed-ml-db1 cockroach sql --insecure --database=distributed_ml
+docker cp backend\database\schema.sql distributed-ml-db1:/tmp/schema.sql
+docker exec distributed-ml-db1 cockroach sql --insecure --database=distributed_ml -f /tmp/schema.sql
 ```
 
 La imagen Compose usa `--insecure` y está destinada al entorno local.
@@ -380,16 +382,19 @@ ni el bloque `CREATE TABLE` sobre un clúster existente.
 
 ### Configurar la conexión
 
-El Backend y cada Worker leen `DATABASE_URL`. En PowerShell, establecer
-esta variable en cada terminal que vaya a ejecutar un proceso:
+El Backend y cada Worker leen `DATABASE_URL`. Si no se define,
+`backend/database/connection.py` usa esta URL local, que lista los tres
+nodos:
 
 ```powershell
-$env:DATABASE_URL = "postgresql://root@127.0.0.1:26257/distributed_ml?sslmode=disable"
+$env:DATABASE_URL = "postgresql://root@127.0.0.1:26257,127.0.0.1:26258,127.0.0.1:26259/distributed_ml?sslmode=disable"
 ```
 
-Si no se define, `backend/database/connection.py` utiliza esa misma URL
-local por defecto. El Worker utiliza un único endpoint configurado; no
-descubre ni conmuta automáticamente entre DB1, DB2 y DB3.
+libpq prueba los hosts en orden: si DB1 cae, los procesos se conectan a
+DB2 o DB3 sin reiniciarse. Cada conexión usa `connect_timeout` de 3 s por
+host y `statement_timeout` de 5 s, de modo que una pérdida de quórum
+produce errores `QueryCanceled` y reintentos en lugar de consultas
+bloqueadas. Si se define una URL propia, conviene listar los tres hosts.
 
 ## Ejecución
 
@@ -431,7 +436,7 @@ Endpoints disponibles:
 
 | Método y ruta | Resultado |
 |---|---|
-| `GET /health` | Comprueba que FastAPI y su conexión a CockroachDB están disponibles; responde HTTP 503 si la DB no está disponible. |
+| `GET /health` | Lee la tabla `nodes` (no solo `SELECT 1`), así que también detecta la pérdida de quórum. Responde HTTP 503 en unos 5 s si la DB no está disponible. |
 | `POST /nodes` | Registra un Worker y devuelve el registro con su `node_id`. |
 | `POST /nodes/{node_id}/heartbeat` | Marca ese Worker `online` y actualiza su Heartbeat por la API. El cliente Worker actual no usa esta ruta después del registro. |
 
@@ -459,8 +464,24 @@ python -m unittest discover -s tests -p "test_*.py" -v
 ## Alcance y limitaciones
 
 - El registro inicial depende de FastAPI; las publicaciones posteriores
-  de Heartbeat y métricas dependen directamente del endpoint de DB
-  configurado.
+  de Heartbeat y métricas van directamente a CockroachDB por cualquiera
+  de los tres hosts de `DATABASE_URL`.
+- Caída de nodos DB, verificada con los tres Workers en marcha:
+
+  | Nodos caídos | Comportamiento |
+  |---|---|
+  | Uno (DB1, DB2 o DB3) | Sin interrupción: heartbeats, liderazgo y `/health` siguen normales. |
+  | Dos | Sin quórum: `/health` responde 503, los Workers registran `QueryCanceled` y reintentan, y el líder revoca su autoridad. |
+  | Tres | Conexiones rechazadas: `/health` responde 503 y los Workers reintentan sin terminar el proceso. |
+
+  Al volver el quórum, todo se recupera solo en unos 10–20 s y los datos
+  persisten. Tras una caída de más de 10 s, algunos Workers pueden
+  aparecer `offline` unos segundos hasta su siguiente heartbeat.
+- CockroachDB v26 muestra el aviso "No license is installed. Throttling
+  will begin after …": sin licencia, limita el rendimiento a partir de la
+  fecha indicada (unos 7 días después de crear el clúster). Antes de la
+  demo, instalar una licencia gratuita de Cockroach Labs o recrear el
+  clúster.
 - No hay frontend ni API operativa para datasets, Jobs, Tasks o resultados.
 - Los módulos de coordinación y entrenamiento no implementan Scheduler,
   elección automática, comunicación Worker-a-Worker, ejecución ML,
@@ -470,9 +491,10 @@ python -m unittest discover -s tests -p "test_*.py" -v
   no equivale a failover de coordinación.
 - No hay monitor que marque automáticamente `offline` a un Worker cuyo
   Heartbeat haya vencido.
-- Los tres contenedores DB y los Workers locales comparten un host; no se
-  ha verificado el factor de replicación efectivo ni el quórum. No se
-  garantiza tolerancia a la pérdida del host.
+- Los tres contenedores DB y los Workers locales comparten un host. Se
+  verificó la replicación (tres réplicas por rango) y la tolerancia a la
+  pérdida de un nodo, pero no se garantiza tolerancia a la pérdida del
+  host.
 - El modo `--insecure` es para desarrollo local, no para despliegues
   expuestos a redes no confiables.
 - `task_attempts` es opcional y no pertenece al esquema principal.

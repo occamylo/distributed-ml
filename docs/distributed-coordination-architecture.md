@@ -67,7 +67,8 @@ candidatos por capacidad.
 - La versión y el DDL desplegado se comprobaron en CockroachDB
   v26.2.2: las cinco tablas originales, la tabla de liderazgo y las
   cuatro columnas métricas de `nodes` se verificaron en el clúster real.
-  No se verificaron el factor de replicación efectivo ni el quórum.
+  También se verificó `num_replicas = 3`, con cada rango de
+  `distributed_ml` replicado en los nodos 1, 2 y 3 (escenario D).
 
 Por tanto, el estado `online` significa que el Worker publicó
 recientemente a CockroachDB; no acredita que pueda coordinar o ejecutar
@@ -367,10 +368,28 @@ por tener más capacidad ni por conservar estado local.
 
 Con tres réplicas efectivas por rango y quórum Raft de dos, un clúster de
 tres nodos puede tolerar la pérdida de un nodo; no tolera perder dos
-nodos del mismo quórum. Tres contenedores no prueban por sí solos que
-cada rango tenga tres réplicas ni que estas estén distribuidas. La
-topología/factor de replicación real debe verificarse antes de afirmar
-esa continuidad. Sin quórum, no se elige ni renueva líder.
+nodos del mismo quórum. Sin quórum, no se elige ni renueva líder.
+
+Verificado en CockroachDB v26.2.2 con FastAPI y tres Workers en marcha:
+
+- **Réplicas:** `num_replicas = 3` y cada rango de `distributed_ml` tiene
+  réplicas en los nodos 1, 2 y 3.
+- **Cae un nodo (DB1, DB2 o DB3):** sin interrupción. El pool usa una URL
+  con los tres hosts, por lo que perder DB1 ya no deja a la aplicación sin
+  base de datos. Antes del cambio, con una URL de un solo host, perder DB1
+  detenía todos los Workers aunque DB2 y DB3 conservaban el quórum.
+- **Caen dos nodos:** el nodo restante acepta conexiones, pero las consultas
+  esperan un quórum que no existe. Con `statement_timeout` de 5 s, los
+  Workers reciben `QueryCanceled` y reintentan, el líder revoca su
+  autoridad al vencer el lease y `/health` responde 503 porque lee la tabla
+  `nodes`. Antes del cambio, los Workers quedaban bloqueados sin registrar
+  errores y `/health` respondía 200 con `SELECT 1`.
+- **Caen los tres:** conexiones rechazadas en los tres hosts, reintentos sin
+  terminar procesos y `/health` en 503.
+- **Recuperación:** al volver el quórum, los procesos se reconectan solos en
+  unos 10–20 s, sin pérdida de datos. Si la caída superó 10 s, el primer
+  Worker que escribe puede marcar `offline` a los demás hasta su siguiente
+  heartbeat.
 
 ### E — Falla el host físico
 

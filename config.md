@@ -117,7 +117,21 @@ Si el clúster es completamente nuevo, crear la base (una sola vez):
 docker compose exec cockroach1 cockroach sql --insecure --host=cockroach1:26257 -e "CREATE DATABASE distributed_ml;"
 ```
 
-El esquema inicial contiene cinco tablas: `nodes`, `datasets`, `jobs`, `tasks` y `results`, junto con sus relaciones e índices. Aplicar el SQL de creación de esquema desde la documentación/archivo SQL del proyecto cuando se prepare una base nueva. No ejecutar nuevamente el DDL en una base que ya tenga esas tablas, salvo que se trate de una migración deliberada.
+El esquema contiene seis tablas: `nodes`, `datasets`, `jobs`, `tasks`, `results` y `cluster_leadership`, junto con sus relaciones e índices. En una base nueva, aplicar `backend/database/schema.sql` copiándolo al contenedor y ejecutándolo con `-f`. Desde la raíz del proyecto:
+
+```bash
+docker cp backend/database/schema.sql distributed-ml-db1:/tmp/schema.sql
+docker exec distributed-ml-db1 cockroach sql --insecure --host=cockroach1:26257 --database=distributed_ml -f /tmp/schema.sql
+```
+
+No pasar el archivo por stdin desde PowerShell (`Get-Content ... | docker exec -i ...`): PowerShell antepone un BOM y CockroachDB responde `syntax error` en la primera línea. No ejecutar nuevamente el DDL en una base que ya tenga esas tablas, salvo que se trate de una migración deliberada.
+
+Verificar que el clúster tiene tres réplicas por rango repartidas en los tres nodos (cada fila debe mostrar `{1,2,3}`):
+
+```bash
+docker exec distributed-ml-db1 cockroach sql --insecure --host=cockroach1:26257 --database=distributed_ml -e "SHOW ZONE CONFIGURATION FROM DATABASE distributed_ml;"
+docker exec distributed-ml-db1 cockroach sql --insecure --host=cockroach1:26257 --database=distributed_ml -e "SELECT table_name, range_id, replicas, lease_holder FROM [SHOW RANGES FROM DATABASE distributed_ml WITH TABLES, DETAILS] ORDER BY 1;"
+```
 
 Verificar las tablas:
 
@@ -130,10 +144,20 @@ docker compose exec cockroach1 cockroach sql --insecure --host=cockroach1:26257 
 `backend/database/connection.py` usa la variable de entorno `DATABASE_URL` si está definida. Si no está definida, el valor predeterminado de desarrollo local es:
 
 ```text
-postgresql://root@127.0.0.1:26257/distributed_ml?sslmode=disable
+postgresql://root@127.0.0.1:26257,127.0.0.1:26258,127.0.0.1:26259/distributed_ml?sslmode=disable
 ```
 
-Este valor funciona cuando FastAPI se ejecuta directamente en el equipo (fuera de Docker) y CockroachDB publica el puerto `26257`.
+La URL lista los tres nodos. libpq los prueba en orden, así que si DB1 cae, FastAPI y los Workers se conectan a DB2 o DB3 sin reiniciarse. Este valor funciona cuando FastAPI y los Workers se ejecutan directamente en el equipo (fuera de Docker) y CockroachDB publica los puertos `26257`, `26258` y `26259`.
+
+El pool también fija, para cada conexión:
+
+| Ajuste | Valor | Para qué |
+|---|---|---|
+| `connect_timeout` | 3 s por host | Pasar rápido al siguiente nodo si uno no responde |
+| `statement_timeout` | 5 s | Sin quórum, CockroachDB deja las consultas esperando sin límite; el timeout las convierte en un error `QueryCanceled` que los Workers registran antes de reintentar |
+| `check` del pool | activado | Descartar conexiones a un nodo caído antes de usarlas |
+
+Si se define `DATABASE_URL` manualmente, conviene listar también los tres hosts.
 
 Si una variable `DATABASE_URL` previa quedó definida en la terminal, puede sobrescribir el valor predeterminado. Para quitarla temporalmente en Git Bash:
 
