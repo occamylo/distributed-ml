@@ -71,7 +71,7 @@ def read_dataset_columns(dataset_id: UUID) -> dict[str, Any]:
         logger.warning("Dataset %s file could not be read (%s).", dataset_id, exc)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="The dataset file is missing or unreadable on this Backend host.",
+            detail="El archivo del dataset no está o no se puede leer en este Backend.",
         ) from exc
     return {"dataset_id": dataset_id, "columns": columns}
 
@@ -84,10 +84,10 @@ def delete_dataset(dataset_id: UUID) -> None:
     except ForeignKeyViolation as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="The dataset is used by one or more Jobs and cannot be deleted.",
+            detail="No se puede borrar: uno o más Jobs usan este dataset.",
         ) from exc
     if not deleted:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No existe el dataset.")
 
     try:
         dataset_storage.delete_file(dataset["file_path"])
@@ -98,5 +98,5 @@ def delete_dataset(dataset_id: UUID) -> None:
 def _get_dataset_or_404(dataset_id: UUID) -> dict[str, Any]:
     dataset = repository.get_dataset(dataset_id)
     if dataset is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No existe el dataset.")
     return dataset

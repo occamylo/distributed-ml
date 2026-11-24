@@ -42,8 +42,8 @@ def plan_reassignments(
         attempts = task.get("attempts") or 0
         if attempts >= max_attempts:
             raise RecoveryError(
-                f"Partition {task['partition_index']} used its {max_attempts} attempts "
-                f"(first run plus {max_attempts - 1} retries)."
+                f"La partición {task['partition_index']} agotó sus {max_attempts} intentos "
+                f"(la ejecución inicial y {max_attempts - 1} reintentos)."
             )
 
     failed_ids = {task["task_id"] for task in failed_tasks}
@@ -52,7 +52,7 @@ def plan_reassignments(
     participants = {task.get("node_id") for task in job_tasks}
     candidates = [node for node in alive if node in participants] or alive
     if not candidates:
-        raise RecoveryError("No Workers are left alive to take the failed Tasks.")
+        raise RecoveryError("No quedan Workers vivos para tomar las Tasks fallidas.")
 
     # The coordinator goes last (architecture doc, section 7).
     candidates.sort(key=lambda node: node == coordinator_node_id)

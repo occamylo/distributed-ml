@@ -158,9 +158,9 @@ def evaluate(
 
 def validate_hyperparameters(learning_rate: float, epochs: int) -> None:
     if not math.isfinite(learning_rate) or learning_rate <= 0:
-        raise ValueError("learning_rate must be a positive number.")
+        raise ValueError("learning_rate debe ser un número positivo.")
     if isinstance(epochs, bool) or not isinstance(epochs, int) or not 1 <= epochs <= MAX_EPOCHS:
-        raise ValueError(f"epochs must be an integer between 1 and {MAX_EPOCHS}.")
+        raise ValueError(f"epochs debe ser un entero entre 1 y {MAX_EPOCHS}.")
 
 
 def _tensors(

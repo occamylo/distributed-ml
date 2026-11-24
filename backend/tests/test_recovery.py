@@ -56,13 +56,13 @@ class PlanReassignmentsTests(unittest.TestCase):
     def test_exhausted_attempts_fail_the_recovery(self) -> None:
         tasks = job_tasks([W1, W2], attempts=MAX_TASK_ATTEMPTS)
 
-        with self.assertRaisesRegex(RecoveryError, "used its 3 attempts"):
+        with self.assertRaisesRegex(RecoveryError, "agotó sus 3 intentos"):
             plan_reassignments([tasks[0]], tasks, [W2], coordinator_node_id=None)
 
     def test_no_survivors_fail_the_recovery(self) -> None:
         tasks = job_tasks([W1, W2])
 
-        with self.assertRaisesRegex(RecoveryError, "No Workers are left"):
+        with self.assertRaisesRegex(RecoveryError, "No quedan Workers vivos"):
             plan_reassignments(tasks, tasks, [], coordinator_node_id=None)
 
 

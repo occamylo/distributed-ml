@@ -106,7 +106,7 @@ class TaskExecutor:
         try:
             prepared = self._prepared_datasets.get(job)
         except DatasetPreparationError as exc:
-            raise TaskRequestError(422, f"Dataset preparation failed: {exc}") from exc
+            raise TaskRequestError(422, f"No se pudo preparar el dataset: {exc}") from exc
 
         try:
             start, end = partition_bounds(list_tasks_by_job(job["job_id"]))[

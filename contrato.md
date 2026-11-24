@@ -285,7 +285,6 @@ Campos de entrada:
 - `target_column`
 - `status`
 - `parameters`
-- `requested_workers`
 - `actual_workers`
 - `train_ratio`
 - `seed`
@@ -299,7 +298,8 @@ Reglas:
 - `created_at` será generado por la base de datos.
 - `status` tendrá como valor predeterminado `pending`.
 - `parameters` tendrá como valor predeterminado un objeto JSON vacío.
-- `actual_workers`, `train_ratio`, `seed`, `error_message`, `started_at` y `completed_at` pueden ser nulos.
+- `requested_workers`, `actual_workers`, `train_ratio`, `seed`, `error_message`, `started_at` y `completed_at` pueden ser nulos.
+- Los Jobs nuevos dejan `requested_workers` en `NULL`; los valores históricos se conservan y no limitan la planificación.
 - Devuelve el registro completo creado.
 
 #### `get_job(job_id)`
@@ -325,7 +325,6 @@ Permite modificar exclusivamente:
 - `target_column`
 - `status`
 - `parameters`
-- `requested_workers`
 - `actual_workers`
 - `train_ratio`
 - `seed`
@@ -515,6 +514,7 @@ Reglas:
 - Devuelve el resultado creado, o `None` si quien llama ya no posee el lease o si el Job no estaba `running`; en ambos casos no modifica nada.
 - Si el Job ya tiene resultado, se propaga el error de unicidad y se revierte toda la transacción.
 - No calcula métricas ni decide cuándo termina un Job: los valores los entrega el coordinador.
+- `metrics.model` guarda el modelo descargable completo (preparación de los datos y pesos); `GET /jobs/{job_id}/model` lo sirve sin modificar el resultado, que sigue siendo inmutable.
 
 #### `update_result(...)`
 
@@ -668,14 +668,14 @@ El código actual dispone de operaciones básicas de persistencia para Jobs y Ta
 
 ### 17.1. Contrato de Job
 
-Un Job representa una solicitud de procesamiento asociada a un Dataset. Para planificarlo se necesitan `job_id`, `dataset_id`, `status` y `requested_workers`. `algorithm`, `target_column`, `parameters`, `train_ratio` y `seed` describen la ejecución futura; el Scheduler los conserva, pero no los interpreta para ejecutar entrenamiento.
+Un Job representa una solicitud de procesamiento asociada a un Dataset. Para planificarlo se necesitan `job_id`, `dataset_id` y `status`. `algorithm`, `target_column`, `parameters`, `train_ratio` y `seed` describen la ejecución futura; el Scheduler los conserva, pero no los interpreta para ejecutar entrenamiento.
 
 - Solo un Job `pending` puede ser tomado para planificación.
-- `requested_workers` es el máximo de Workers distintos que se pueden asignar al Job.
 - `actual_workers` representa el número de Workers distintos que recibieron al menos una Task del Job; no se calcula a partir de Workers solicitados ni seleccionados sin asignación.
 - El Job pasa a `running` cuando se confirma la primera asignación de Task. `started_at` se establece en esa transición.
 - `completed`, `failed` y `cancelled` son estados existentes en el esquema de referencia. Sus transiciones y la relación con la agregación o cancelación no forman parte de esta tarea.
-- **Política aprobada e implementada:** cuando hay menos Workers elegibles que `requested_workers`, el Job permanece `pending` y no se crean Tasks ni asignaciones parciales; el Scheduler lo reintenta en cada ciclo hasta que haya suficientes Workers. Para que un Job no espere indefinidamente, `POST /jobs` rechaza con 422 un `requested_workers` mayor que el número de Workers en línea (README, paso 4: no puede superar los elegibles).
+- **Política acordada e implementada:** el Scheduler usa dinámicamente todos los Workers elegibles disponibles y crea las Tasks según esa cantidad (3 particiones de train por Worker, `coordinator/partitioner.py`). Si no hay ninguno, el Job permanece `pending` y no se crean Tasks ni asignaciones; se reintenta en cada ciclo.
+- `requested_workers` se conserva como campo nullable para compatibilidad con Jobs históricos; no se requiere ni se usa para la planificación, y `POST /jobs` ya no lo recibe.
 
 Un Job debe referenciar un Dataset existente. La lectura del archivo y la determinación de sus filas o particiones no corresponden al contrato del Job.
 
@@ -701,21 +701,23 @@ El vencimiento de `lease_until` no autoriza por sí solo a reasignar una Task. *
 
 Los datos disponibles en `nodes` para planificar son `status`, `last_heartbeat`, `cpu_available_cores`, `ram_available_mb`, `active_tasks` y `metrics_updated_at`. El Worker actual publica las métricas de disponibilidad y fija `active_tasks` en cero porque aún no ejecuta Tasks.
 
-Como filtro inicial propuesto:
+Los criterios de elegibilidad acordados son:
 
-- Excluir nodos cuyo `status` sea `offline`.
-- Exigir Heartbeat y métricas recientes. El umbral inicial de 10 segundos aparece en la documentación arquitectónica como criterio futuro; debe confirmarse antes de implementarlo.
-- Exigir métricas de CPU y RAM disponibles distintas de `NULL`; los valores totales no sustituyen a los disponibles.
-- Usar `active_tasks` como señal de carga, no como límite de concurrencia: el modelo no define capacidad máxima de Tasks por Worker.
+- Exigir que `status` sea `online`.
+- Exigir que `last_heartbeat` y `metrics_updated_at` tengan una antigüedad máxima de 10 segundos, evaluada con el reloj de CockroachDB.
+- Exigir que `cpu_available_cores` sea finita y mayor que cero y que `ram_available_mb` sea mayor que cero. Los valores totales no sustituyen a los disponibles.
+- Exigir que `active_tasks` sea un entero no negativo. Se usa únicamente para ordenar y priorizar Workers con menor carga; no es un límite de concurrencia.
 
-No se establece aquí un umbral de CPU/RAM para ejecutar Tasks ni una regla adicional para `busy`, porque el código y el README no fijan esos límites para el Scheduler. Deben decidirse antes de la implementación. La selección final nunca puede superar `requested_workers`. No se define un algoritmo de puntuación o balanceo avanzado en esta tarea.
+No se establece un máximo de Tasks concurrentes por Worker en esta etapa. Se seleccionan todos los Workers elegibles disponibles; no se define un algoritmo de puntuación o balanceo avanzado.
+
+La detección de desconexiones marca `offline` a los Workers cuyo Heartbeat haya vencido, siempre que haya un Worker activo ejecutando el mecanismo de detección. Las métricas vencidas excluyen al Worker de la selección del Scheduler, pero no cambian por sí solas su estado.
 
 ### 17.4. Responsabilidades y comunicación del Scheduler
 
 El Scheduler es la lógica del Worker que posee el lease vigente. Su alcance mínimo propuesto es:
 
 1. Consultar Jobs `pending` y los registros de Workers.
-2. Filtrar Workers con los criterios aprobados y seleccionar como máximo `requested_workers`.
+2. Filtrar y seleccionar todos los Workers que cumplan los criterios de elegibilidad en el ciclo de planificación.
 3. Obtener una descripción de particiones de un Partitioner y crear Tasks persistentes.
 4. Asignar Tasks a Workers y actualizar `actual_workers` y el estado del Job de forma consistente.
 5. Detener nuevas operaciones de planificación si pierde la autoridad.
@@ -748,8 +750,8 @@ La siguiente implementación deberá definir operaciones de Repository para cons
 - **Correspondencia del esquema:** el DDL de referencia del README incluye `attempt_id`, `lease_until` y `leader_epoch`, pero no se debe asumir que existen en la base física. `schema.sql` no contiene el esquema integral y las funciones actuales del Repository no leen ni escriben esos campos. Antes de usarlos debe confirmarse el esquema desplegado; cualquier migración requiere una decisión separada.
 - **Estado documental de liderazgo:** el código actual inicia elección desde el Worker, mientras que el README todavía describe la elección automática y la comunicación Worker-a-Worker como pendientes. Esta sección distingue la capacidad de liderazgo existente de las capacidades de Scheduler/cola aún no implementadas.
 - **Particionado:** `partitioner.py` no implementa generación de particiones. Falta definir el número de Tasks por Job, cómo se distribuyen las filas y cómo puede el Worker reconstruir el segmento a partir de `partition_index` y `rows_assigned`, sin añadir campos por suposición.
-- **Workers insuficientes:** resuelto. Se aprobó la propuesta conservadora de 17.1: el Job espera en `pending`.
-- **Disponibilidad y capacidad:** deben definirse el umbral de vigencia, la política para `busy`, los mínimos de CPU/RAM y el máximo de Tasks concurrentes por Worker.
+- **Workers insuficientes:** resuelto. El Job usa todos los Workers elegibles y espera en `pending` solo si no hay ninguno (17.1).
+- **Disponibilidad y capacidad:** los criterios acordados están descritos en 17.3; no se establece un máximo de Tasks concurrentes por Worker en esta etapa.
 - **Entrega al ejecutor:** debe definirse el mecanismo de consulta, asignación y reconocimiento de Tasks. Actualmente el Worker solo publica Heartbeat/métricas.
 - **Fencing del Repository:** se necesitan operaciones transaccionales que combinen validación del liderazgo y mutación de la cola; las funciones existentes no ofrecen esa atomicidad.
 

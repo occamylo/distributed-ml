@@ -93,36 +93,23 @@ class Scheduler:
 
     def _schedule_job(self, job: Record, epoch: int) -> bool:
         job_id = job.get("job_id")
-        requested_workers = job.get("requested_workers")
         dataset_id = job.get("dataset_id")
-        if (
-            not isinstance(job_id, UUID)
-            or not isinstance(dataset_id, UUID)
-            or not isinstance(requested_workers, int)
-            or isinstance(requested_workers, bool)
-            or requested_workers <= 0
-        ):
+        if not isinstance(job_id, UUID) or not isinstance(dataset_id, UUID):
             logger.error("Skipping Job with invalid scheduling fields: %s.", job_id)
             return True
 
-        # The coordinator reserves CPU/RAM for coordination (architecture
-        # doc, section 7): it goes last, so it only joins a Job when no other
-        # Worker is available, and ties send extra Tasks to the others.
-        candidates = self._eligible_workers(requested_workers + 1)
-        candidates.sort(key=lambda node: node["node_id"] == self._coordination.node_id)
-        workers = candidates[:requested_workers]
-        # Approved policy (contrato.md §17.1): without enough eligible
-        # Workers the Job stays ``pending`` and gets no partial assignment;
-        # it is retried on the next cycle.
-        if len(workers) < requested_workers:
+        # Agreed policy (contrato.md §17.1): a Job uses every eligible Worker;
+        # ``requested_workers`` is a legacy field and is ignored. The
+        # coordinator reserves CPU/RAM for coordination (architecture doc,
+        # section 7): it goes last, so ties send extra Tasks to the others.
+        workers = self._eligible_workers()
+        workers.sort(key=lambda node: node["node_id"] == self._coordination.node_id)
+        # Without eligible Workers the Job stays ``pending`` with no Tasks and
+        # is retried on the next cycle.
+        if not workers:
             if job_id not in self._waiting_jobs:
                 self._waiting_jobs.add(job_id)
-                logger.info(
-                    "Job %s waits in pending: %s of %s requested Worker(s) are eligible.",
-                    job_id,
-                    len(workers),
-                    requested_workers,
-                )
+                logger.info("Job %s waits in pending: no Worker is eligible.", job_id)
             return True
         self._waiting_jobs.discard(job_id)
 
@@ -138,7 +125,7 @@ class Scheduler:
             try:
                 train_rows = len(self._prepared_datasets.get(job).y_train)
             except DatasetPreparationError as exc:
-                return self._fail_job(job, epoch, f"Dataset preparation failed: {exc}")
+                return self._fail_job(job, epoch, f"No se pudo preparar el dataset: {exc}")
             partitions = build_partitions(
                 train_rows, partition_count(train_rows, len(workers))
             )
@@ -155,26 +142,12 @@ class Scheduler:
                 return self._retains_leadership(epoch)
             tasks = created_tasks
 
-        # A Job may have several Tasks per Worker; the limit applies to the
-        # number of distinct Workers that take part.
+        # A Job has several Tasks per Worker; each pending Task goes to the
+        # eligible Worker with the fewest Tasks, in preference order.
         task_counts = Counter(
             task["node_id"] for task in tasks if isinstance(task.get("node_id"), UUID)
         )
-        assigned_node_ids = set(task_counts)
-        if len(assigned_node_ids) > requested_workers:
-            logger.error(
-                "Skipping Job %s because its Tasks exceed the requested Worker count.",
-                job_id,
-            )
-            return True
-
-        # Workers already in the Job keep receiving Tasks; new Workers join
-        # only up to the requested count. ``workers`` is ordered by preference.
-        eligible_ids = [worker["node_id"] for worker in workers]
-        participants = [node for node in eligible_ids if node in assigned_node_ids]
-        participants += [node for node in eligible_ids if node not in assigned_node_ids][
-            : max(0, requested_workers - len(assigned_node_ids))
-        ]
+        participants = [worker["node_id"] for worker in workers]
         pending_task_ids = [
             task["task_id"]
             for task in sorted(tasks, key=lambda task: task["partition_index"])
@@ -199,8 +172,6 @@ class Scheduler:
             )
             if assigned_task is None and not self._retains_leadership(epoch):
                 return False
-            if assigned_task is not None:
-                assigned_node_ids.add(worker_node_id)
 
         if not self._retains_leadership(epoch):
             return False
@@ -219,7 +190,7 @@ class Scheduler:
                 if isinstance(task.get("node_id"), UUID)
             }
         )
-        if actual_workers == 0 or actual_workers > requested_workers:
+        if actual_workers == 0:
             logger.error(
                 "Job %s has an invalid assigned Worker count (%s).",
                 job_id,
@@ -274,7 +245,8 @@ class Scheduler:
             logger.error("Job %s failed: %s", job["job_id"], reason)
         return True
 
-    def _eligible_workers(self, requested_workers: int) -> list[Record]:
+    def _eligible_workers(self) -> list[Record]:
+        """Every eligible Worker, least loaded and most capable first."""
         eligible: list[Record] = []
         for node in list_nodes_with_fresh_metrics():
             node_id = node.get("node_id")
@@ -306,7 +278,7 @@ class Scheduler:
                 str(node["node_id"]),
             )
         )
-        return eligible[:requested_workers]
+        return eligible
 
     def _current_leader_epoch(self) -> int | None:
         if not self._coordination.is_leader:

@@ -21,12 +21,12 @@ export function estimatePlan({ rows, trainRatio, workers }) {
   };
 }
 
-export function startTraining({ datasetId, target, workers, learningRate, epochs, trainRatio, seed }) {
+// El Job usa todos los Workers activos (contrato.md §17.1): no se pide un número.
+export function startTraining({ datasetId, target, learningRate, epochs, trainRatio, seed }) {
   return createJob({
     dataset_id: datasetId,
-    algorithm: "logistic_regression",
+    algorithm: "logistic-regression",
     target_column: target,
-    requested_workers: workers,
     train_ratio: trainRatio,
     seed,
     parameters: { learning_rate: learningRate, epochs },

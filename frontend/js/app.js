@@ -1,12 +1,14 @@
 // Interfaz de Distributed ML: navegación por hash, polling cada 3 s
 // (README: actualización de estados por polling) y dibujo de cada vista.
-import { getCluster, getHealth } from "./services/cluster.service.js";
+import { getCluster, getHealth, getTechnicalStatus } from "./services/cluster.service.js";
 import { isOnline, listWorkers } from "./services/nodes.service.js";
 import { deleteDataset, getColumns, listDatasets, uploadDataset } from "./services/datasets.service.js";
 import { getResult, getTasks, listJobs } from "./services/jobs.service.js";
 import { DEFAULTS, estimatePlan, startTraining } from "./services/training.service.js";
 
-const VIEWS = ["panel", "cluster", "entrenar", "resultados"];
+// Vista del usuario (transparente) y Vista técnica (estado real del clúster).
+const USER_VIEWS = ["entrenar", "resultados"];
+const VIEWS = [...USER_VIEWS, "panel", "cluster", "actividad"];
 const POLL_MS = 3000;
 const WORKER_COLORS = ["#173FAD", "#B3263E", "#2F7A5B", "#8A5CC7", "#C77A1A", "#4E5D78"];
 const STATUS_LABEL = {
@@ -29,6 +31,7 @@ const state = {
   view: null,
   health: null,
   cluster: null,
+  tech: null,
   workers: [],
   jobs: [],
   datasets: [],
@@ -37,7 +40,7 @@ const state = {
   error: null,
   loading: false,
   selectedJob: readStored("selectedJob"),
-  train: { datasetId: null, columns: [], target: null, workers: null, confirmDelete: null, busy: false },
+  train: { datasetId: null, columns: [], target: null, confirmDelete: null, busy: false },
 };
 
 function readStored(key) {
@@ -86,18 +89,23 @@ function notice(kind, text) {
 
 /* ---------- Navegación ---------- */
 function currentView() {
-  const view = (location.hash || "#panel").slice(1);
-  return VIEWS.includes(view) ? view : "panel";
+  const view = (location.hash || "#entrenar").slice(1);
+  return VIEWS.includes(view) ? view : "entrenar";
 }
 function showView() {
   const view = currentView();
   const changed = view !== state.view;
   state.view = view;
   VIEWS.forEach((name) => { $(`view-${name}`).hidden = name !== view; });
+  const mode = USER_VIEWS.includes(view) ? "user" : "tech";
   document.querySelectorAll("nav.tabs a").forEach((a) => {
+    a.hidden = a.dataset.mode !== mode;
     if (a.dataset.view === view) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
   });
+  const toggle = $("mode-toggle");
+  toggle.textContent = mode === "user" ? "Vista técnica" : "Volver al entrenamiento";
+  toggle.href = mode === "user" ? "#panel" : "#entrenar";
   if (changed) window.scrollTo(0, 0);
   refresh();
 }
@@ -121,16 +129,18 @@ async function refresh() {
       return;
     }
     const view = state.view;
-    const [jobs, datasets, workers, cluster] = await Promise.all([
+    const [jobs, datasets, workers, cluster, tech] = await Promise.all([
       settle(listJobs()),
       settle(listDatasets()),
       settle(listWorkers()),
       view === "cluster" || view === "panel" ? settle(getCluster()) : Promise.resolve(null),
+      view === "cluster" || view === "actividad" ? settle(getTechnicalStatus()) : Promise.resolve(null),
     ]);
     if (jobs.ok) state.jobs = jobs.value;
     if (datasets.ok) state.datasets = datasets.value;
     if (workers.ok) state.workers = workers.value;
     if (cluster && cluster.ok) state.cluster = cluster.value;
+    if (tech && tech.ok) state.tech = tech.value;
     const failed = [jobs, datasets, workers].find((r) => !r.ok);
     state.error = failed ? failed.error.message : null;
     await loadDetails(view);
@@ -185,6 +195,7 @@ function render() {
   if (state.view === "cluster") renderCluster();
   if (state.view === "entrenar") renderTrain();
   if (state.view === "resultados") renderResults();
+  if (state.view === "actividad") renderActivity();
 }
 
 function renderHealth() {
@@ -226,7 +237,7 @@ function renderPanel() {
       </div>
       ${active.status === "running"
         ? `<div class="bar live" aria-label="Entrenando"><span></span></div>`
-        : notice("warn", `Espera ${active.requested_workers} Workers elegibles para empezar.`)}
+        : notice("warn", "Espera a que haya Workers elegibles para empezar.")}
       <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px">
         <div class="mini"><div class="eyebrow">Tiempo</div><div class="v">${seconds(elapsed)}</div></div>
         <div class="mini"><div class="eyebrow">Épocas</div><div class="v">${esc(active.parameters?.epochs ?? "—")}</div></div>
@@ -264,34 +275,38 @@ function renderPanel() {
           return `<tr class="clickable" data-open-job="${esc(job.job_id)}" tabindex="0">
             <td>${esc(datasetName(job.dataset_id))}<div class="sub">${esc(job.target_column)} · ${esc(job.parameters?.epochs ?? "—")} épocas</div></td>
             <td>${pill(job.status)}</td>
-            <td>${esc(job.actual_workers ?? "—")} de ${esc(job.requested_workers)}</td>
+            <td>${esc(job.actual_workers ?? "—")}</td>
             <td>${result ? pct(result.accuracy) : "—"}</td>
             <td>${seconds(jobDuration(job))}</td></tr>`;
         }).join("")}</tbody></table>`);
 }
 
 function renderCluster() {
-  const c = state.cluster;
-  const db = c?.database;
-  $("db-summary").textContent = db
-    ? `${db.reachable} de ${db.total} nodos responden · ${db.quorum ? "con quórum" : "sin quórum"}`
+  const tech = state.tech;
+  const nodes = tech?.database_nodes?.items || [];
+  const replication = tech?.replication?.items || [];
+  const ready = nodes.filter((n) => n.health?.state === "ready" && n.sql?.state === "available").length;
+  $("db-summary").textContent = nodes.length
+    ? `${ready} de ${nodes.length} nodos listos · quórum Raft: ${ready >= Math.floor(nodes.length / 2) + 1 ? "sí" : "no"}`
     : "";
-  const replication = db?.replication;
-  const allThree = replication && replication.ranges > 0 && replication.replica_counts["3"] === replication.ranges;
-  $("db-nodes").innerHTML = !db ? `<div class="glass card">${errorBanner() || "Consultando la base de datos…"}</div>` :
-    db.nodes.map((node) => `
-      <div class="glass card">
-        <div class="node-top"><h3>${esc(node.name)}</h3>${node.reachable ? `<span class="pill online">Responde</span>` : `<span class="pill offline">Sin respuesta</span>`}</div>
-        <dl class="kv"><dt>Dirección</dt><dd class="mono nowrap">${esc(node.host)}:${esc(node.port)}</dd>
-        <dt>Latencia</dt><dd>${node.reachable ? `${node.latency_ms} ms` : "—"}</dd>
-        <dt>Estado</dt><dd>${node.reachable ? "Acepta SQL" : esc(node.error || "Caído")}</dd></dl>
-      </div>`).join("") + `
-      <div class="glass card">
-        <div class="node-top"><h3>Replicación</h3>${replication ? `<span class="pill ${allThree ? "online" : "pending"}">${allThree ? "Completa" : "Parcial"}</span>` : `<span class="pill idle">Sin datos</span>`}</div>
-        <dl class="kv"><dt>Rangos</dt><dd>${replication ? replication.ranges : "—"}</dd>
-        <dt>Réplicas</dt><dd>${replication ? Object.entries(replication.replica_counts).map(([n, count]) => `${count} con ${n}`).join(" · ") : "—"}</dd>
-        <dt>En los nodos</dt><dd class="nowrap">${replication ? `{${replication.replica_nodes.join(", ")}}` : "—"}</dd></dl>
+  const byNode = new Map(replication.map((r) => [r.node_id, r]));
+  $("db-nodes").innerHTML = !nodes.length
+    ? `<div class="glass card">${errorBanner() || "Consultando la base de datos…"}</div>`
+    : nodes.map((node) => {
+      const ok = node.sql?.state === "available";
+      const healthy = node.health?.state === "ready";
+      const ranges = byNode.get(node.membership?.node_id);
+      const problems = ranges ? ranges.unavailable_count + ranges.underreplicated_count : null;
+      return `<div class="glass card">
+        <div class="node-top"><h3>${esc(node.name)}</h3>${ok && healthy ? `<span class="pill online">Listo</span>` : ok ? `<span class="pill pending">${esc(node.health?.state || "sin estado")}</span>` : `<span class="pill offline">Sin respuesta</span>`}</div>
+        <dl class="kv">
+          <dt>SQL</dt><dd class="mono nowrap">:${esc(node.sql_port)}${ok ? ` · ${esc(node.sql.latency_ms)} ms` : ""}</dd>
+          <dt>Consola</dt><dd class="mono nowrap">${node.admin_port ? `:${esc(node.admin_port)}` : "—"}</dd>
+          <dt>Nodo</dt><dd>${node.membership?.node_id != null ? `n${esc(node.membership.node_id)} · ${esc(node.membership.build || "")}` : "—"}</dd>
+          <dt>Rangos</dt><dd>${ranges ? `${esc(ranges.range_count)}${problems ? ` · ${problems} con problemas` : " · sin problemas"}` : "—"}</dd>
+        </dl>
       </div>`;
+    }).join("");
 
   const workers = [...state.workers].sort((a, b) => (b.is_leader - a.is_leader) || (isOnline(b) - isOnline(a)));
   $("workers").innerHTML = workers.length === 0
@@ -324,14 +339,56 @@ function renderCluster() {
       <div class="legend">${holders.map((id) => `<span><i style="background:${workerColor(id)}"></i>${esc(short(id))}</span>`).join("")}</div>`;
 }
 
+/* ---------- Actividad (Vista técnica) ---------- */
+function eventLabel(type) {
+  const names = {
+    node_restart: "Reinicio de nodo",
+    node_join: "Nodo se une al clúster",
+    node_decommissioning: "Nodo en retiro",
+    finish_schema_change: "Cambio de esquema terminado",
+    create_table: "Tabla creada",
+    create_database: "Base de datos creada",
+    set_cluster_setting: "Ajuste del clúster",
+  };
+  return names[type] || type;
+}
+
+function renderActivity() {
+  const tech = state.tech;
+  if (!tech) {
+    $("events-list").innerHTML = `<div class="empty">${errorBanner() || "Consultando…"}</div>`;
+    return;
+  }
+  $("activity-updated").textContent = `Actualizado ${new Date(tech.updated_at).toLocaleTimeString("es")} · cada ${tech.refresh_interval_seconds || 4} s`;
+  $("events-source").textContent = tech.events?.source || "";
+  const events = tech.events?.items || [];
+  $("events-list").innerHTML = events.length === 0
+    ? `<div class="empty">${esc(tech.events?.message || "Sin eventos recientes.")}</div>`
+    : `<table style="min-width:520px"><thead><tr><th>Cuándo</th><th>Evento</th><th>Nodo</th></tr></thead><tbody>${events.map((e) => `
+        <tr><td>${new Date(e.timestamp).toLocaleString("es")}</td><td>${esc(eventLabel(e.event_type))}</td><td>${e.reporting_id != null ? `n${esc(e.reporting_id)}` : "—"}</td></tr>`).join("")}</tbody></table>`;
+
+  const jobs = tech.jobs?.items || [];
+  $("recent-jobs-tech").innerHTML = jobs.length === 0 ? `<div class="empty">Sin Jobs.</div>` :
+    `<table><thead><tr><th>Job</th><th>Estado</th><th>Workers</th></tr></thead><tbody>${jobs.map((j) => `
+      <tr class="clickable" data-open-job="${esc(j.job_id)}" tabindex="0"><td class="mono">${esc(short(j.job_id))}<div class="sub">${esc(j.target_column)}</div></td><td>${pill(j.status)}</td><td>${esc(j.actual_workers ?? "—")}</td></tr>`).join("")}</tbody></table>`;
+
+  const tasks = tech.tasks?.items || [];
+  $("recent-tasks-tech").innerHTML = tasks.length === 0 ? `<div class="empty">Sin Tasks.</div>` :
+    `<table><thead><tr><th>Task</th><th>Worker</th><th>Estado</th></tr></thead><tbody>${tasks.map((k) => `
+      <tr><td>p${esc(k.partition_index)} · ${esc(k.rows_assigned ?? "—")} filas<div class="sub mono">Job ${esc(short(k.job_id))}</div></td><td class="mono">${esc(short(k.node_id) || "—")}</td><td>${pill(k.status)}<div class="sub">intento ${esc(k.attempts)}</div></td></tr>`).join("")}</tbody></table>`;
+
+  const datasets = tech.datasets?.items || [];
+  $("recent-datasets-tech").innerHTML = datasets.length === 0 ? `<div class="empty">Sin datasets.</div>` :
+    `<table><thead><tr><th>Dataset</th><th>Filas</th><th>Columnas</th></tr></thead><tbody>${datasets.map((d) => `
+      <tr><td>${esc(d.name)}<div class="sub">${new Date(d.created_at).toLocaleString("es")}</div></td><td>${esc(d.row_count)}</td><td>${esc(d.column_count)}</td></tr>`).join("")}</tbody></table>`;
+}
+
 /* ---------- Entrenar ---------- */
 function renderTrain() {
   const online = onlineWorkers().length;
-  const maxWorkers = Math.max(1, online);
-  if (state.train.workers == null || state.train.workers > maxWorkers) state.train.workers = Math.min(3, maxWorkers);
-  $("workers-seg").innerHTML = Array.from({ length: maxWorkers }, (_, i) => i + 1)
-    .map((n) => `<button type="button" data-workers="${n}" aria-pressed="${n === state.train.workers}" ${online === 0 ? "disabled" : ""}>${n}</button>`)
-    .join("");
+  $("workers-info").textContent = online === 0
+    ? "No hay Workers activos: el Job esperará en pending."
+    : `Se usarán los ${online} Workers activos.`;
 
   if (state.train.datasetId && !state.datasets.some((d) => d.dataset_id === state.train.datasetId)) {
     state.train.datasetId = null;
@@ -377,14 +434,14 @@ function renderSummary() {
   $("epochs-out").textContent = String(p.epochs);
   $("ratio-out").textContent = `${Math.round(p.trainRatio * 100)} %`;
   const dataset = state.datasets.find((d) => d.dataset_id === state.train.datasetId);
-  const plan = dataset ? estimatePlan({ rows: dataset.row_count, trainRatio: p.trainRatio, workers: state.train.workers || 1 }) : null;
+  const plan = dataset ? estimatePlan({ rows: dataset.row_count, trainRatio: p.trainRatio, workers: Math.max(1, onlineWorkers().length) }) : null;
   $("sum-name").innerHTML = dataset ? `${esc(dataset.name)} <em>listo</em>` : "Elige un dataset";
   $("sum-train").textContent = plan ? plan.train : "—";
   $("sum-test").textContent = plan ? plan.test : "—";
   $("sum-parts").textContent = plan ? plan.partitions : "—";
   $("sum-rows").textContent = plan ? (plan.minRows === plan.maxRows ? plan.minRows : `${plan.minRows}–${plan.maxRows}`) : "—";
   $("sum-target").textContent = state.train.target || "—";
-  $("sum-workers").textContent = `${state.train.workers || "—"} de ${onlineWorkers().length} en línea`;
+  $("sum-workers").textContent = `${onlineWorkers().length} activos`;
   $("train-submit").disabled = !dataset || !state.train.target || onlineWorkers().length === 0 || state.train.busy;
 }
 
@@ -455,7 +512,6 @@ async function handleSubmit(event) {
   const result = await settle(startTraining({
     datasetId: state.train.datasetId,
     target: state.train.target,
-    workers: state.train.workers,
     ...p,
   }));
   state.train.busy = false;
@@ -466,7 +522,8 @@ async function handleSubmit(event) {
     return;
   }
   const prep = result.value.preparation;
-  toast(`Job creado · ${prep.train_rows} filas de train y ${prep.test_rows} de test`);
+  const excluded = prep.excluded_columns || [];
+  toast(`Job creado · ${prep.train_rows} filas de train y ${prep.test_rows} de test${excluded.length ? ` · se excluyen ${excluded.join(", ")}` : ""}`);
   state.jobs.unshift(result.value);
   openJob(result.value.job_id);
 }
@@ -495,7 +552,7 @@ function renderResults() {
   const meta = `
     <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr))">
       <div class="mini"><div class="eyebrow">Target</div><div class="v">${esc(job.target_column)}</div></div>
-      <div class="mini"><div class="eyebrow">Workers</div><div class="v">${esc(job.actual_workers ?? "—")} de ${esc(job.requested_workers)}</div></div>
+      <div class="mini"><div class="eyebrow">Workers</div><div class="v">${esc(job.actual_workers ?? "—")}</div></div>
       <div class="mini"><div class="eyebrow">Épocas</div><div class="v">${esc(params.epochs ?? "—")}</div></div>
       <div class="mini"><div class="eyebrow">Learning rate</div><div class="v">${esc(params.learning_rate ?? "—")}</div></div>
       <div class="mini"><div class="eyebrow">Train</div><div class="v">${job.train_ratio != null ? Math.round(job.train_ratio * 100) + " %" : "—"}</div></div>
@@ -504,7 +561,7 @@ function renderResults() {
 
   let body = "";
   if (job.status === "pending") {
-    body = notice("warn", `En espera: el Scheduler lo arranca cuando haya ${job.requested_workers} Workers elegibles.`);
+    body = notice("warn", "En espera: el Scheduler lo arranca en cuanto haya Workers elegibles.");
   } else if (job.status === "running") {
     body = `<div class="glass card" style="gap:14px"><span class="eyebrow">Entrenando · ${seconds(jobDuration(job))}</span>
       <div class="bar live"><span></span></div>
@@ -526,6 +583,15 @@ function renderResults() {
         <div class="glass card"><span class="eyebrow">Accuracy train</span><div class="big" style="font-size:44px">${pct(train.accuracy)}</div></div>
         <div class="glass card"><span class="eyebrow">Duración</span><div class="big" style="font-size:44px">${seconds(result.duration_seconds)}</div></div>
       </div>
+      ${m.model?.format ? `
+      <div class="glass card" style="flex-direction:row;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:16px">
+        <div style="min-width:0;flex:1 1 320px">
+          <span class="eyebrow">Modelo entrenado</span>
+          <p class="sub" style="margin:6px 0 0">Un archivo JSON con los pesos y la preparación de los datos. Úsalo en tu proyecto con <span class="mono">examples/predecir.py</span>, sin PyTorch.${(m.model.excluded_columns || []).length ? ` Columnas excluidas por ser identificadores: ${esc(m.model.excluded_columns.join(", "))}.` : ""}</p>
+        </div>
+        <a class="btn btn-primary" href="/jobs/${esc(job.job_id)}/model" download>Descargar modelo
+          <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v12M7 11l5 5 5-5M5 20h14"/></svg></a>
+      </div>` : notice("info", "Este resultado es anterior al modelo descargable. Entrena de nuevo para poder descargarlo.")}
       <div class="two">
         <section class="main glass card" style="padding:28px" aria-labelledby="curve-title">
           <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:12px">
@@ -612,12 +678,11 @@ function hideMessage(id) {
 
 /* ---------- Eventos ---------- */
 document.addEventListener("click", (event) => {
-  const target = event.target.closest("[data-open-job],[data-dataset],[data-target],[data-workers],[data-delete],[data-delete-confirm]");
+  const target = event.target.closest("[data-open-job],[data-dataset],[data-target],[data-delete],[data-delete-confirm]");
   if (!target) return;
   if (target.dataset.openJob) openJob(target.dataset.openJob);
   else if (target.dataset.dataset) selectDataset(target.dataset.dataset);
   else if (target.dataset.target) { state.train.target = target.dataset.target; renderTrain(); }
-  else if (target.dataset.workers) { state.train.workers = Number(target.dataset.workers); renderTrain(); }
   else if (target.dataset.delete) {
     state.train.confirmDelete = target.dataset.delete;
     renderTrain();

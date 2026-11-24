@@ -5,7 +5,7 @@ from typing import Any
 
 import psycopg
 from psycopg import Error as PsycopgError
-from psycopg.conninfo import conninfo_to_dict
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import ConnectionPool, PoolTimeout
 
 # libpq tries the hosts in order, so losing the first CockroachDB node does
@@ -81,6 +81,18 @@ def database_hosts() -> list[tuple[str, int]]:
     if len(ports) == 1:
         ports = ports * len(hosts)
     return [(host, int(port)) for host, port in zip(hosts, ports)]
+
+
+def get_cluster_connection_infos() -> tuple[str, ...]:
+    """One single-host conninfo per CockroachDB node in DATABASE_URL.
+
+    Used by the technical status view to query each node on its own.
+    """
+    params = conninfo_to_dict(os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL))
+    return tuple(
+        make_conninfo(**{**params, "host": host, "port": str(port)})
+        for host, port in database_hosts()
+    )
 
 
 def probe_database_hosts(timeout_seconds: float = 2.0) -> list[dict[str, Any]]:

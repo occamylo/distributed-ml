@@ -6,21 +6,27 @@
 <title>Distributed ML Studio</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600&display=swap">
-<link rel="stylesheet" href="css/styles.css?v=2">
+<link rel="stylesheet" href="css/styles.css?v=4">
 </head>
 <body>
 <div class="orbs" aria-hidden="true"><div class="orb blue"></div><div class="orb red"></div></div>
 
 <div class="wrap">
   <header class="top">
-    <a class="brand" href="#panel">Distributed <em>ML</em></a>
+    <a class="brand" href="#entrenar">Distributed <em>ML</em></a>
+    <!-- Dos formas de ver el proyecto: la del usuario (transparente) y la
+         Vista técnica, con el estado real del clúster. -->
     <nav class="tabs glass" aria-label="Principal">
-      <a href="#panel" data-view="panel">Panel</a>
-      <a href="#cluster" data-view="cluster">Clúster</a>
-      <a href="#entrenar" data-view="entrenar">Entrenar</a>
-      <a href="#resultados" data-view="resultados">Resultados</a>
+      <a href="#entrenar" data-view="entrenar" data-mode="user">Entrenar</a>
+      <a href="#resultados" data-view="resultados" data-mode="user">Resultados</a>
+      <a href="#panel" data-view="panel" data-mode="tech">Panel</a>
+      <a href="#cluster" data-view="cluster" data-mode="tech">Clúster</a>
+      <a href="#actividad" data-view="actividad" data-mode="tech">Actividad</a>
     </nav>
-    <div class="health glass" id="health" role="status"><span class="dot"></span><span>Conectando…</span></div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <div class="health glass" id="health" role="status"><span class="dot"></span><span>Conectando…</span></div>
+      <a class="btn btn-ghost btn-small" id="mode-toggle" href="#panel">Vista técnica</a>
+    </div>
   </header>
 
   <!-- PANEL -->
@@ -73,6 +79,36 @@
     </div>
   </main>
 
+  <!-- ACTIVIDAD (Vista técnica) -->
+  <main id="view-actividad" hidden>
+    <div style="display:flex;flex-direction:column;gap:40px">
+      <section style="display:flex;flex-direction:column;gap:18px">
+        <span class="eyebrow rule">Vista técnica · solo lectura</span>
+        <h1>Lo que pasa<br><em>por dentro.</em></h1>
+        <p class="lede">Eventos de CockroachDB y los registros más recientes de Jobs, Tasks y Datasets, tal como los ve la base de datos. Se actualiza cada pocos segundos.</p>
+        <span class="sub" id="activity-updated"></span>
+      </section>
+      <section class="glass" aria-labelledby="events-title" style="padding-bottom:10px">
+        <div class="section-head"><h2 id="events-title">Eventos <em>del clúster</em></h2><span class="sub" id="events-source"></span></div>
+        <div class="tablebox" id="events-list"></div>
+      </section>
+      <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr));align-items:start">
+        <section class="glass" aria-labelledby="rjobs-title" style="padding-bottom:10px">
+          <div class="section-head"><h2 id="rjobs-title">Jobs</h2></div>
+          <div class="tablebox" id="recent-jobs-tech"></div>
+        </section>
+        <section class="glass" aria-labelledby="rtasks-title" style="padding-bottom:10px">
+          <div class="section-head"><h2 id="rtasks-title">Tasks</h2></div>
+          <div class="tablebox" id="recent-tasks-tech"></div>
+        </section>
+        <section class="glass" aria-labelledby="rdatasets-title" style="padding-bottom:10px">
+          <div class="section-head"><h2 id="rdatasets-title">Datasets</h2></div>
+          <div class="tablebox" id="recent-datasets-tech"></div>
+        </section>
+      </div>
+    </div>
+  </main>
+
   <!-- ENTRENAR -->
   <main id="view-entrenar" hidden>
     <div style="display:flex;flex-direction:column;gap:40px">
@@ -107,8 +143,8 @@
             <div class="field"><label for="epochs"><span>Épocas</span><output id="epochs-out" for="epochs">100</output></label><input id="epochs" type="range" min="10" max="1000" step="10" value="100"></div>
             <div class="field"><label for="ratio"><span>Datos para entrenar</span><output id="ratio-out" for="ratio">80 %</output></label><input id="ratio" type="range" min="0.5" max="0.9" step="0.05" value="0.8"></div>
             <div style="display:flex;flex-wrap:wrap;gap:24px;align-items:flex-end;justify-content:space-between">
-              <div class="field"><span class="label" id="workers-label">Workers</span>
-                <div class="seg" role="group" aria-labelledby="workers-label" id="workers-seg"></div>
+              <div class="field"><span class="label">Workers</span>
+                <span class="sub" id="workers-info">Se usan todos los Workers activos.</span>
               </div>
               <div class="field"><label for="seed"><span>Seed</span></label><input id="seed" type="number" value="42" min="0" step="1"></div>
             </div>
@@ -131,7 +167,7 @@
           </dl>
           <div id="train-msg" hidden></div>
           <button class="btn btn-primary" type="submit" id="train-submit">Iniciar entrenamiento</button>
-          <p class="sub" style="margin:0">Si no hay suficientes Workers libres, el Job espera en pending hasta que los haya.</p>
+          <p class="sub" style="margin:0">El Job usa todos los Workers activos. Si no hay ninguno, espera en pending.</p>
         </aside>
       </form>
     </div>
@@ -154,3 +190,4 @@
 <script type="module" src="js/app.js"></script>
 </body>
 </html>
+

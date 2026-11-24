@@ -78,7 +78,7 @@ def read_columns(relative_path: str) -> list[str]:
     with path.open("r", encoding="utf-8-sig", newline="") as csv_file:
         header = next(csv.reader(csv_file), None)
     if header is None:
-        raise DatasetValidationError("The stored dataset has no header row.")
+        raise DatasetValidationError("El dataset guardado no tiene encabezado.")
     return [column.strip() for column in header]
 
 
@@ -89,7 +89,7 @@ def delete_file(relative_path: str) -> None:
 
 def _validate_extension(original_filename: str | None) -> None:
     if not original_filename or not original_filename.lower().endswith(".csv"):
-        raise DatasetValidationError("The file must have a .csv extension.")
+        raise DatasetValidationError("El archivo debe tener extensión .csv.")
 
 
 def _copy_with_limit(source: BinaryIO, destination: Path) -> int:
@@ -99,11 +99,11 @@ def _copy_with_limit(source: BinaryIO, destination: Path) -> int:
             written += len(chunk)
             if written > MAX_DATASET_BYTES:
                 raise DatasetValidationError(
-                    f"The file exceeds the {MAX_DATASET_BYTES // (1024 * 1024)} MB limit."
+                    f"El archivo supera el límite de {MAX_DATASET_BYTES // (1024 * 1024)} MB."
                 )
             target.write(chunk)
     if written == 0:
-        raise DatasetValidationError("The file is empty.")
+        raise DatasetValidationError("El archivo está vacío.")
     return written
 
 
@@ -120,42 +120,42 @@ def _inspect_csv(path: Path) -> tuple[list[str], int]:
                     continue
                 if len(row) != len(columns):
                     raise DatasetValidationError(
-                        f"Line {reader.line_num} has {len(row)} values; "
-                        f"the header has {len(columns)} columns."
+                        f"La línea {reader.line_num} tiene {len(row)} valores; "
+                        f"el encabezado tiene {len(columns)} columnas."
                     )
                 row_count += 1
     except UnicodeDecodeError as exc:
-        raise DatasetValidationError("The file must be encoded as UTF-8.") from exc
+        raise DatasetValidationError("El archivo debe estar codificado en UTF-8.") from exc
     except csv.Error as exc:
-        raise DatasetValidationError(f"The file is not a valid CSV ({exc}).") from exc
+        raise DatasetValidationError(f"El archivo no es un CSV válido ({exc}).") from exc
 
     if row_count < MIN_DATA_ROWS:
         raise DatasetValidationError(
-            f"The file needs at least {MIN_DATA_ROWS} data rows; it has {row_count}."
+            f"El archivo necesita al menos {MIN_DATA_ROWS} filas de datos; tiene {row_count}."
         )
     return columns, row_count
 
 
 def _validate_header(header: list[str] | None) -> list[str]:
     if header is None:
-        raise DatasetValidationError("The file has no header row.")
+        raise DatasetValidationError("El archivo no tiene encabezado.")
 
     columns = [column.strip() for column in header]
     if len(columns) < MIN_COLUMNS:
         raise DatasetValidationError(
-            f"The file needs at least {MIN_COLUMNS} comma-separated columns "
-            "(features and a target)."
+            f"El archivo necesita al menos {MIN_COLUMNS} columnas separadas por comas "
+            "(variables y una columna objetivo)."
         )
     if any(not column for column in columns):
-        raise DatasetValidationError("Every column in the header needs a name.")
+        raise DatasetValidationError("Todas las columnas del encabezado necesitan un nombre.")
     if any(len(column) > MAX_COLUMN_NAME_LENGTH for column in columns):
         raise DatasetValidationError(
-            f"Column names can have at most {MAX_COLUMN_NAME_LENGTH} characters."
+            f"Los nombres de columna pueden tener como máximo {MAX_COLUMN_NAME_LENGTH} caracteres."
         )
 
     duplicates = sorted({column for column in columns if columns.count(column) > 1})
     if duplicates:
         raise DatasetValidationError(
-            "Column names must be unique; repeated: " + ", ".join(duplicates) + "."
+            "Los nombres de columna deben ser únicos; repetidos: " + ", ".join(duplicates) + "."
         )
     return columns

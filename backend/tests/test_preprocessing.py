@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from coordinator.preprocessing import DatasetPreparationError, prepare_dataset
+from coordinator.preprocessing import DatasetPreparationError, encode_row, prepare_dataset
 
 
 class PrepareDatasetTests(unittest.TestCase):
@@ -19,7 +19,7 @@ class PrepareDatasetTests(unittest.TestCase):
     def binary_csv(self, rows: int = 40) -> Path:
         lines = ["edad,ciudad,aprobó"]
         for i in range(rows):
-            lines.append(f"{20 + i},{['Bogotá', 'Cali', 'Medellín'][i % 3]},{'sí' if i % 2 else 'no'}")
+            lines.append(f"{18 + (i * 7) % 45},{['Bogotá', 'Cali', 'Medellín'][i % 3]},{'sí' if i % 2 else 'no'}")
         return self.write("\n".join(lines) + "\n")
 
     def test_encodes_numeric_and_categorical_features_in_column_order(self) -> None:
@@ -59,7 +59,7 @@ class PrepareDatasetTests(unittest.TestCase):
         self.assertAlmostEqual(math.sqrt(variance), 1.0, places=9)
 
     def test_multiclass_numeric_target_is_sorted_numerically(self) -> None:
-        lines = ["x,clase"] + [f"{i},{[10, 2, 1][i % 3]}" for i in range(30)]
+        lines = ["x,clase"] + [f"{i * 3},{[10, 2, 1][i % 3]}" for i in range(30)]
         prepared = prepare_dataset(self.write("\n".join(lines)), "clase")
 
         self.assertEqual(prepared.class_labels, ["1", "2", "10"])
@@ -72,33 +72,65 @@ class PrepareDatasetTests(unittest.TestCase):
         self.assertTrue(all(row == [0.0] for row in prepared.x_train))
 
     def test_rejects_unknown_target(self) -> None:
-        with self.assertRaisesRegex(DatasetPreparationError, "does not exist"):
+        with self.assertRaisesRegex(DatasetPreparationError, "no existe"):
             prepare_dataset(self.binary_csv(), "resultado")
 
     def test_rejects_missing_values_and_names_the_column(self) -> None:
         path = self.write("a,b,y\n1,,0\n2,3,1\n3,NA,0\n4,5,1\n")
-        with self.assertRaisesRegex(DatasetPreparationError, r"'b' \(2\)"):
+        with self.assertRaisesRegex(DatasetPreparationError, r"«b» \(2\)"):
             prepare_dataset(path, "y")
 
     def test_rejects_single_class_target(self) -> None:
         path = self.write("a,y\n1,0\n2,0\n3,0\n")
-        with self.assertRaisesRegex(DatasetPreparationError, "at least 2 classes"):
+        with self.assertRaisesRegex(DatasetPreparationError, "al menos 2 clases"):
             prepare_dataset(path, "y")
 
     def test_rejects_continuous_target(self) -> None:
         lines = ["a,precio"] + [f"{i},{i * 1.5}" for i in range(40)]
-        with self.assertRaisesRegex(DatasetPreparationError, "continuous"):
+        with self.assertRaisesRegex(DatasetPreparationError, "continuo"):
             prepare_dataset(self.write("\n".join(lines)), "precio")
 
     def test_rejects_class_with_a_single_row(self) -> None:
         path = self.write("a,y\n1,0\n2,0\n3,1\n4,1\n5,2\n")
-        with self.assertRaisesRegex(DatasetPreparationError, "too few rows for: 2"):
+        with self.assertRaisesRegex(DatasetPreparationError, "faltan filas en: 2"):
             prepare_dataset(path, "y")
 
     def test_rejects_identifier_like_text_column(self) -> None:
         lines = ["codigo,y"] + [f"id-{i},{i % 2}" for i in range(120)]
-        with self.assertRaisesRegex(DatasetPreparationError, "'codigo'"):
+        with self.assertRaisesRegex(DatasetPreparationError, "«codigo»"):
             prepare_dataset(self.write("\n".join(lines)), "y")
+
+    def test_identifier_columns_are_excluded_automatically(self) -> None:
+        lines = ["PassengerId,NumerPerson,edad,y"] + [
+            f"{i + 1},{i},{18 + (i * 7) % 45},{i % 2}" for i in range(40)
+        ]
+        prepared = prepare_dataset(self.write(chr(10).join(lines)), "y")
+
+        self.assertEqual(prepared.excluded_columns, ["PassengerId", "NumerPerson"])
+        self.assertEqual(prepared.input_columns, ["edad"])
+        self.assertEqual(prepared.feature_names, ["edad"])
+        self.assertEqual(prepared.summary()["excluded_columns"], ["PassengerId", "NumerPerson"])
+
+    def test_small_or_repeated_whole_numbers_are_not_identifiers(self) -> None:
+        lines = ["cantidad,y"] + [f"{i % 5},{i % 2}" for i in range(40)]
+        prepared = prepare_dataset(self.write(chr(10).join(lines)), "y")
+
+        self.assertEqual(prepared.excluded_columns, [])
+
+    def test_only_identifiers_left_is_rejected(self) -> None:
+        lines = ["id,y"] + [f"{i},{i % 2}" for i in range(20)]
+        with self.assertRaisesRegex(DatasetPreparationError, "identificadores"):
+            prepare_dataset(self.write(chr(10).join(lines)), "y")
+
+    def test_encode_row_reproduces_the_training_encoding(self) -> None:
+        prepared = prepare_dataset(self.binary_csv(rows=60), "aprobó")
+        spec = prepared.preprocessing_spec()
+        numeric = prepared.numeric_features[0]
+
+        encoded = encode_row(spec, {"edad": "30", "ciudad": "Cali", "aprobó": "sí"})
+
+        self.assertAlmostEqual(encoded[0], (30 - numeric.mean) / numeric.std)
+        self.assertEqual(encoded[1:], [0.0, 1.0, 0.0])
 
 
 if __name__ == "__main__":

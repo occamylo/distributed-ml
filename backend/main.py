@@ -1,10 +1,10 @@
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from psycopg import Error as PsycopgError
 from psycopg_pool import PoolTimeout
@@ -62,8 +62,21 @@ def health() -> JSONResponse:
     )
 
 
+class FrontendFiles(StaticFiles):
+    """Serves frontend/ asking the browser to revalidate every file.
+
+    Without it a browser can keep an old JavaScript module after an update and
+    mix it with new ones. Unchanged files still answer 304 via their ETag.
+    """
+
+    def file_response(self, *args: Any, **kwargs: Any) -> Response:
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 # The interface (frontend/) is served from the same origin as the API, so the
 # browser needs no CORS. Mounted last: every API route above takes precedence.
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 if FRONTEND_DIR.is_dir():
-    app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+    app.mount("/", FrontendFiles(directory=FRONTEND_DIR, html=True), name="frontend")

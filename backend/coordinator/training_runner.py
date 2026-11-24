@@ -38,6 +38,7 @@ from psycopg_pool import PoolTimeout
 from coordinator.aggregator import aggregate_gradients, apply_update
 from coordinator.dispatcher import TaskFailure, TaskGradient, dispatch_round
 from coordinator.job_data import PreparedDatasetCache
+from coordinator.model_export import build_model_artifact
 from coordinator.preprocessing import DatasetPreparationError, PreparedDataset
 from coordinator.recovery import MAX_TASK_ATTEMPTS, RecoveryError, plan_reassignments
 from coordinator.scheduler import TASK_LEASE_DURATION_SECONDS
@@ -70,6 +71,7 @@ from workers.training_engine import (
 DEFAULT_RUNNER_INTERVAL_SECONDS = 1.0
 LOG_EVERY_EPOCHS = 10
 MAX_LOSS_HISTORY_POINTS = 200
+MODEL_ALGORITHM = "logistic-regression"
 # Extra seconds after the Heartbeat timeout before a silent Worker counts as down.
 DETECTION_MARGIN_SECONDS = 3.0
 logger = logging.getLogger(__name__)
@@ -96,8 +98,8 @@ def build_result_metrics(
 
     Holds what the result screen and the local vs distributed comparison
     need: both evaluations, the training configuration actually used, a
-    sampled loss curve and the final weights (small for Logistic
-    Regression, so no separate model file is written).
+    sampled loss curve and, under ``model``, the downloadable model artifact
+    (preprocessing plus final weights; see ``coordinator/model_export.py``).
     """
     history = summary.loss_history
     step = max(1, -(-len(history) // MAX_LOSS_HISTORY_POINTS))
@@ -118,7 +120,14 @@ def build_result_metrics(
             "test_rows": len(prepared.y_test),
         },
         "train_loss_by_epoch": [[index + 1, history[index]] for index in sampled],
-        "model": weights.to_dict(),
+        "model": build_model_artifact(
+            prepared,
+            weights,
+            algorithm=MODEL_ALGORITHM,
+            learning_rate=summary.learning_rate,
+            epochs=len(history),
+            test_accuracy=test_evaluation.accuracy,
+        ),
     }
 
 
@@ -131,7 +140,7 @@ class TrainingStopped(Exception):
 
 
 def _describe_failures(failures: list[TaskFailure]) -> str:
-    return "; ".join(f"Task {f.task_id} on Worker {f.node_id}: {f.reason}" for f in failures)[:800]
+    return "; ".join(f"Task {f.task_id} en el Worker {f.node_id}: {f.reason}" for f in failures)[:800]
 
 
 class TrainingCoordinator:
@@ -202,7 +211,7 @@ class TrainingCoordinator:
         try:
             prepared = self._prepared_datasets.get(job)
         except DatasetPreparationError as exc:
-            self._fail_job(job_id, leader_epoch, f"Dataset preparation failed: {exc}")
+            self._fail_job(job_id, leader_epoch, f"No se pudo preparar el dataset: {exc}")
             return
 
         parameters = job.get("parameters") or {}
@@ -211,7 +220,7 @@ class TrainingCoordinator:
         try:
             validate_hyperparameters(learning_rate, epochs)
         except ValueError as exc:
-            self._fail_job(job_id, leader_epoch, f"Invalid training parameters: {exc}")
+            self._fail_job(job_id, leader_epoch, f"Parámetros de entrenamiento inválidos: {exc}")
             return
 
         started_tasks = update_job_tasks_as_leader(
@@ -313,7 +322,7 @@ class TrainingCoordinator:
                 self._fail_job(
                     job_id,
                     leader_epoch,
-                    f"Training epoch {training_epoch} had a non-recoverable Task failure: "
+                    f"La época {training_epoch} tuvo una falla de Task no recuperable: "
                     + _describe_failures(fatal),
                 )
                 return None
@@ -325,8 +334,8 @@ class TrainingCoordinator:
                 self._fail_job(
                     job_id,
                     leader_epoch,
-                    f"Training epoch {training_epoch} could not recover its Tasks: {exc} "
-                    f"Last failures: {_describe_failures(outcome.failures)}",
+                    f"La época {training_epoch} no pudo recuperar sus Tasks: {exc} "
+                    f"Últimas fallas: {_describe_failures(outcome.failures)}",
                 )
                 return None
 
@@ -396,7 +405,7 @@ class TrainingCoordinator:
             if updated is None:
                 self._ensure_leadership(leader_epoch)
                 raise RecoveryError(
-                    f"Partition {task['partition_index']} changed while it was being reassigned."
+                    f"La partición {task['partition_index']} cambió mientras se reasignaba."
                 )
             logger.warning(
                 "Job %s: partition %s reassigned from Worker %s to Worker %s "

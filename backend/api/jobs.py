@@ -1,11 +1,14 @@
+import re
 from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 import dataset_storage
+from coordinator.model_export import MODEL_FORMAT
 from coordinator.preprocessing import (
     DEFAULT_SEED,
     DEFAULT_TRAIN_RATIO,
@@ -25,7 +28,8 @@ class JobResponse(BaseModel):
     target_column: str
     status: str
     parameters: dict[str, Any]
-    requested_workers: int
+    # Legacy field: kept nullable for historical Jobs, not used to plan.
+    requested_workers: int | None = None
     actual_workers: int | None
     train_ratio: float | None
     seed: int | None
@@ -60,9 +64,10 @@ class TrainingParameters(BaseModel):
 
 class JobCreate(BaseModel):
     dataset_id: UUID
-    algorithm: Literal["logistic_regression"] = "logistic_regression"
+    # Only Logistic Regression trains (README: one algorithm). The name
+    # follows main's convention.
+    algorithm: Literal["logistic-regression"] = "logistic-regression"
     target_column: str = Field(min_length=1)
-    requested_workers: int = Field(gt=0)
     parameters: TrainingParameters = Field(default_factory=TrainingParameters)
     train_ratio: float = Field(default=DEFAULT_TRAIN_RATIO, gt=0, lt=1)
     seed: int = DEFAULT_SEED
@@ -74,24 +79,11 @@ def create_job(job: JobCreate) -> dict[str, Any]:
     if dataset is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Dataset not found.",
+            detail="No existe el dataset.",
         )
 
-    # The requested Workers cannot exceed the available ones (README, step 4);
-    # otherwise the Job would wait in pending forever (contrato.md §17.1).
-    online_workers = sum(
-        1 for node in repository.list_nodes_with_fresh_metrics() if node.get("status") == "online"
-    )
-    if job.requested_workers > online_workers:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"requested_workers is {job.requested_workers}, but only "
-                f"{online_workers} Worker(s) are online."
-            ),
-        )
-
-    # Running the full preparation here rejects unusable datasets before a
+    # The Job uses every eligible Worker (contrato.md §17.1): no Worker count
+    # is requested here. Running the full preparation here rejects unusable datasets before a
     # Job exists, instead of letting the Coordinator fail it later.
     try:
         csv_path = dataset_storage.resolve_path(dataset["file_path"])
@@ -100,7 +92,7 @@ def create_job(job: JobCreate) -> dict[str, Any]:
     if csv_path is None or not csv_path.is_file():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="The dataset file is not available on this Backend host.",
+            detail="El archivo del dataset no está disponible en este Backend.",
         )
 
     try:
@@ -113,14 +105,21 @@ def create_job(job: JobCreate) -> dict[str, Any]:
     except DatasetPreparationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    target = job.target_column.strip()
+    headers = dataset_storage.read_columns(dataset["file_path"])
+    used_columns = set(prepared.input_columns)
     created = repository.create_job(
         dataset_id=job.dataset_id,
         algorithm=job.algorithm,
-        target_column=job.target_column.strip(),
-        requested_workers=job.requested_workers,
+        target_column=target,
         status="pending",
-        # Stored with defaults filled in, so the Job records exactly what runs.
-        parameters=job.parameters.model_dump(),
+        # Stored with defaults filled in, so the Job records exactly what runs,
+        # plus the dataset columns as main records them.
+        parameters={
+            **job.parameters.model_dump(),
+            "dataset_headers": headers,
+            "feature_columns": [header for header in headers if header in used_columns],
+        },
         train_ratio=job.train_ratio,
         seed=job.seed,
     )
@@ -139,7 +138,7 @@ def read_job(job_id: UUID) -> dict[str, Any]:
     if job is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Job not found.",
+            detail="No existe el Job.",
         )
     return job
 
@@ -149,7 +148,7 @@ def read_job_tasks(job_id: UUID) -> list[dict[str, Any]]:
     if repository.get_job(job_id) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Job not found.",
+            detail="No existe el Job.",
         )
     return repository.list_tasks_by_job(job_id)
 
@@ -159,12 +158,45 @@ def read_job_result(job_id: UUID) -> dict[str, Any]:
     if repository.get_job(job_id) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Job not found.",
+            detail="No existe el Job.",
         )
     result = repository.get_result_by_job(job_id)
     if result is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="The Job has no result yet.",
+            detail="El Job todavía no tiene resultado.",
         )
     return result
+
+
+@router.get("/jobs/{job_id}/model")
+def download_job_model(job_id: UUID) -> JSONResponse:
+    """The trained model as a JSON file the user takes to their own project."""
+    job = repository.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No existe el Job.")
+    result = repository.get_result_by_job(job_id)
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="El Job todavía no tiene resultado.",
+        )
+    model = (result.get("metrics") or {}).get("model") or {}
+    if model.get("format") != MODEL_FORMAT:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Este resultado es anterior al modelo descargable y no guarda la "
+                "preparación de los datos. Vuelve a entrenar para obtenerlo."
+            ),
+        )
+
+    dataset = repository.get_dataset(job["dataset_id"])
+    dataset_name = dataset["name"] if dataset else "dataset"
+    artifact = {**model, "job_id": str(job_id), "dataset": dataset_name}
+    slug = re.sub(r"[^a-z0-9]+", "-", dataset_name.lower()).strip("-") or "dataset"
+    filename = f"modelo-{slug}-{str(job_id)[:8]}.json"
+    return JSONResponse(
+        content=artifact,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

@@ -17,3 +17,9 @@ export async function getHealth() {
 export function getCluster() {
   return request("/cluster");
 }
+
+// Vista técnica: estado de CockroachDB según su API de administración, eventos
+// y registros recientes. El backend lo cachea unos segundos.
+export function getTechnicalStatus() {
+  return request("/cluster/technical-status");
+}

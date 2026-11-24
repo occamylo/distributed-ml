@@ -4,12 +4,14 @@ Distributed ML es un proyecto académico para explorar cómo se relacionan
 un servicio web, varios procesos Worker y una base de datos distribuida
 en un sistema de entrenamiento de Machine Learning.
 
-El objetivo arquitectónico es repartir el procesamiento de un dataset
-entre Workers y persistir su estado en CockroachDB. El código actual
-incluye el servicio FastAPI básico, el registro de Workers, la publicación
-directa de Heartbeat y métricas en CockroachDB y primitivas persistentes
-de liderazgo. La interfaz web, el Scheduler y el entrenamiento
-distribuido todavía no están implementados.
+El usuario sube un CSV, elige la columna objetivo y lanza un
+entrenamiento. El dataset se divide en particiones según los Workers
+activos, cada Worker calcula el gradiente de sus particiones y un Worker
+coordinador los reúne para actualizar un único modelo de Logistic
+Regression. El estado de todo vive en un clúster CockroachDB de tres
+nodos.
+
+Para instalar y arrancar el proyecto, la guía es [`config.md`](config.md).
 
 ## Características y estado
 
@@ -18,14 +20,16 @@ distribuido todavía no están implementados.
 | Clúster local CockroachDB de tres nodos | Verificado: un solo clúster, `num_replicas = 3` y cada rango con réplicas en los tres nodos. La app sigue funcionando si cae cualquier nodo y responde con errores claros si se pierde el quórum. |
 | Registro inicial de Workers | Implementado con `POST /nodes`. |
 | Heartbeat y métricas de Workers | Implementados: cada Worker publica directamente en CockroachDB cada 3 segundos por defecto. |
-| Lease persistente de liderazgo | Tabla y operaciones de repositorio implementadas; no hay elección automática. |
+| Liderazgo | Implementado: los Workers eligen un coordinador con el lease de `cluster_leadership`; si cae, otro toma el lease con una época nueva. |
 | Carga de datasets CSV | Implementada: `POST /datasets` recibe el archivo, lo valida, lo guarda en `backend/storage/datasets/` y registra sus metadatos. |
 | Preparación de datos | Implementada: `POST /jobs` valida el target, codifica, normaliza y separa train/test estratificado antes de crear el Job. |
 | Modelo Logistic Regression (PyTorch) | Implementado: softmax binario/multiclase, gradiente por partición, agregación ponderada y evaluación; entrenamiento local de referencia. |
 | Ejecución de Tasks en Workers | Implementada: cada Worker calcula el gradiente de su partición de train cuando el coordinador se lo pide, con verificación de `attempt_id` y época del líder. |
-| Frontend | No implementado. |
-| Scheduler | Implementado en el Worker líder: elige Workers por capacidad, reparte las filas de train en más Tasks que Workers (3 por Worker) y las asigna de forma equilibrada. |
+| Interfaz web | Implementada en `frontend/`: Panel, Clúster, Entrenar y Resultados, conectada a la API y servida por FastAPI en `http://127.0.0.1:8000/`. |
+| Vista técnica | `GET /cluster/technical-status` reúne el estado real de los nodos CockroachDB (API de administración), réplicas, liderazgo, Workers y registros recientes. |
+| Scheduler | Implementado en el Worker líder: usa todos los Workers elegibles, reparte las filas de train en más Tasks que Workers (3 por Worker) y las asigna de forma equilibrada. |
 | Ciclo de entrenamiento distribuido | Implementado en el Worker líder: una ronda por época, agregación ponderada de gradientes, actualización de pesos y transición de Tasks y Job a `completed`. Da la misma pérdida que el entrenamiento local. |
+| Modelo descargable | Implementado: botón "Descargar modelo" en Resultados (`GET /jobs/{job_id}/model`). Es un JSON con la preparación de los datos y los pesos; `examples/predecir.py` lo usa en cualquier proyecto con la biblioteca estándar de Python, sin PyTorch. |
 | Evaluación y resultados | Implementados: el coordinador evalúa con el conjunto de test y, en una sola transacción, completa Tasks y Job y guarda el resultado; `GET /jobs/{job_id}/result` lo devuelve. |
 | Recuperación de Tasks | Implementada: si un Worker cae durante el entrenamiento, el coordinador confirma la caída por Heartbeat, lo marca `offline` y reasigna sus Tasks a los sobrevivientes dentro de la misma época, con hasta 3 intentos por Task. Probado al caer un Worker y al caer el líder: el Job termina con el mismo resultado que el entrenamiento local. |
 
@@ -46,8 +50,8 @@ su cuenta a CockroachDB para las publicaciones periódicas.
 ```mermaid
 flowchart LR
     User[Usuario]
-    UI[Frontend web<br/>no implementado]
-    API[FastAPI<br/>/health y nodos]
+    UI[Interfaz web<br/>frontend/]
+    API[FastAPI<br/>API y archivos de la interfaz]
     Repo[Repository y pool psycopg]
     W1[Worker 1]
     W2[Worker 2]
@@ -59,8 +63,8 @@ flowchart LR
         AppData[(datasets, jobs, tasks, results)]
     end
 
-    User -. uso previsto .-> UI
-    UI -. solicitudes futuras .-> API
+    User --> UI
+    UI -->|polling cada 3 s| API
     W1 -->|POST /nodes al iniciar| API
     W2 -->|POST /nodes al iniciar| API
     W3 -->|POST /nodes al iniciar| API
@@ -69,8 +73,10 @@ flowchart LR
     W2 -->|Heartbeat y métricas SQL cada 3 s| Nodes
     W3 -->|Heartbeat y métricas SQL cada 3 s| Nodes
     Repo --> Leadership
-    Repo -. futura persistencia de Jobs y Tasks .-> AppData
-    W1 -. elección automática futura .-> Leadership
+    Repo --> AppData
+    W1 -->|lease del coordinador| Leadership
+    W1 -->|gradientes por HTTP interno| W2
+    W1 -->|gradientes por HTTP interno| W3
 ```
 
 ### Componentes
@@ -81,21 +87,21 @@ flowchart LR
   del registro.
 - **Workers:** cada proceso se registra una vez por HTTP, conserva el
   `node_id` recibido y mantiene su propio pool de CockroachDB. Publica el
-  estado, el Heartbeat y las métricas cada 3 segundos por defecto. No
-  ejecuta entrenamiento ni participa en una elección de liderazgo.
+  estado, el Heartbeat y las métricas cada 3 segundos, participa en la
+  elección del coordinador y calcula el gradiente de las Tasks que le
+  asignan.
 - **Repository y conexión:** proporcionan operaciones de persistencia
-  usando el pool síncrono de Psycopg. El repositorio incluye operaciones
-  para el lease, pero estas no son invocadas automáticamente por los
-  Workers.
+  usando el pool síncrono de Psycopg. Las mutaciones de coordinación
+  validan el liderazgo en la misma transacción.
 - **CockroachDB:** conserva nodos, metadatos de aplicación y la fila de
   liderazgo. Docker Compose define tres contenedores en el mismo host;
   tres contenedores no demuestran por sí solos replicación de datos ni
   tolerancia a la pérdida de un host.
-- **Coordinador:** en el diseño objetivo, un Worker con el lease vigente
-  coordinará Jobs y Tasks. La elección, el Scheduler y la comunicación
-  Worker-a-Worker aún no están implementados.
-- **Frontend:** todavía no hay interfaz conectada a la API. Hay un
-  prototipo visual en `frontend/prototipo/` como referencia de diseño.
+- **Coordinador:** el Worker con el lease vigente ejecuta el Scheduler,
+  el ciclo de entrenamiento, la evaluación y la recuperación de Tasks.
+- **Interfaz:** `frontend/` (HTML, CSS y JavaScript sin framework). Tiene
+  la parte del usuario (Entrenar y Resultados) y la parte técnica (Panel
+  y Clúster).
 
 ## Flujo de funcionamiento
 
@@ -131,14 +137,13 @@ implementado.
    `datasets` (implementado).
 2. El usuario crea un Job con `POST /jobs`. La API prepara el dataset
    (valida el target, codifica, normaliza y separa train/test) y, si
-   todo es válido, registra parámetros, algoritmo, columna objetivo y
-   cantidad de Workers en `jobs` (implementado).
+   todo es válido, registra parámetros, algoritmo y columna objetivo en
+   `jobs`. No se pide un número de Workers (implementado).
 3. Los Workers eligen un coordinador con el lease de `cluster_leadership`
    (implementado).
-4. El Scheduler del coordinador elige Workers por sus métricas en
-   `nodes`. Si no hay tantos Workers elegibles como `requested_workers`,
-   el Job espera en `pending` sin asignaciones parciales. Cuando los hay,
-   prepara el dataset y reparte **solo las filas de train** en
+4. El Scheduler del coordinador usa **todos los Workers elegibles** según
+   sus métricas en `nodes` (`contrato.md` §17.1). Si no hay ninguno, el
+   Job espera en `pending` sin Tasks. Cuando los hay, prepara el dataset y reparte **solo las filas de train** en
    rangos contiguos (`partitioner.py`). Crea **más particiones que
    Workers**: 3 por Worker participante (9 para 3 Workers), sin superar
    el número de filas. Cada Task va al Worker participante con menos
@@ -173,7 +178,7 @@ implementado.
    gradientes que sí llegaron y recupera solo las Tasks fallidas, dentro
    de la misma época y con los mismos pesos (implementado, ver
    "Recuperación de Tasks").
-9. Una interfaz consultará el estado del Job y sus métricas (pendiente).
+9. La interfaz consulta por polling el estado del Job, sus Tasks y su resultado (implementado).
 
 #### Recuperación de Tasks
 
@@ -206,7 +211,20 @@ Si cae el coordinador, otro Worker adquiere el lease al vencer (10 s),
 retoma el Job desde los pesos iniciales y, en su primera ronda, recupera
 las Tasks del coordinador caído con el mismo procedimiento.
 
-Prueba con 3 Workers, 9 Tasks y 600 épocas:
+Pruebas con el dataset del Titanic (`train_data.csv`, 792 filas, target
+`Survived`, 200 épocas); el modelo descargado, usado con
+`examples/predecir.py`, acierta en las mismas 649 filas que el modelo
+entrenado:
+
+| Workers | Tasks | Accuracy test | Duración | Igual al local |
+|---|---|---|---|---|
+| 1 | 3 | 77.2 % | 8.4 s | Sí |
+| 3 | 9 (3 por Worker) | 77.2 % | 15.0 s | Sí |
+
+Con un dataset tan pequeño, más Workers tardan más por el costo de
+comunicación de cada ronda; el resultado es idéntico.
+
+Prueba de caídas con 3 Workers, 9 Tasks y 600 épocas:
 
 | Caída | Qué pasó | Resultado |
 |---|---|---|
@@ -284,11 +302,14 @@ pero todavía no contiene archivos.
 │   │   ├── dispatcher.py      # Envía una ronda y recoge los gradientes
 │   │   ├── training_runner.py # Ciclo de épocas, evaluación y resultado
 │   │   ├── recovery.py        # Reasignación de Tasks de un Worker caído
+│   │   ├── model_export.py    # Modelo descargable (JSON) y predicción
 │   │   └── aggregator.py      # Promedio ponderado y actualización de pesos
 │   ├── database/
 │   │   ├── connection.py
 │   │   ├── repository.py
-│   │   └── schema.sql         # Esquema completo: 6 tablas y fila de liderazgo
+│   │   ├── schema.sql         # Esquema completo: 6 tablas y fila de liderazgo
+│   │   └── migrations/
+│   │       └── 001_make_requested_workers_nullable.sql  # Para bases existentes
 │   ├── storage/
 │   │   └── datasets/
 │   ├── tests/
@@ -296,6 +317,10 @@ pero todavía no contiene archivos.
 │   │   ├── test_partitioner.py
 │   │   ├── test_preprocessing.py
 │   │   ├── test_recovery.py
+│   │   ├── test_model_export.py
+│   │   ├── test_cluster_api.py
+│   │   ├── test_jobs_api.py
+│   │   ├── test_scheduler.py
 │   │   └── test_training_engine.py
 │   └── workers/
 │       ├── worker.py
@@ -304,9 +329,15 @@ pero todavía no contiene archivos.
 │       └── training_engine.py   # Modelo y gradiente de una partición (PyTorch)
 ├── docs/
 │   └── distributed-coordination-architecture.md
+├── examples/
+│   └── predecir.py            # Usa un modelo descargado en otro proyecto
 ├── frontend/
-│   └── prototipo/
-│       └── distributed-ml-prototipo.html  # Prototipo visual, sin conexión a la API
+│   ├── index.html             # Panel, Clúster, Entrenar y Resultados
+│   ├── css/styles.css         # Tema blanco estilo iOS, acento cobalto
+│   └── js/
+│       ├── app.js             # Navegación, polling y vistas
+│       ├── api.js             # Cliente HTTP de la API
+│       └── services/          # cluster, nodes, datasets, jobs, training
 └── docker-compose.yml
 ```
 
@@ -380,7 +411,7 @@ CREATE TABLE jobs (
     target_column STRING NOT NULL,
     status STRING NOT NULL DEFAULT 'pending',
     parameters JSONB NOT NULL DEFAULT '{}'::JSONB,
-    requested_workers INT4 NOT NULL,
+    requested_workers INT4,
     actual_workers INT4,
     train_ratio FLOAT8,
     seed INT8,
@@ -392,7 +423,8 @@ CREATE TABLE jobs (
         CHECK (status IN (
             'pending', 'running', 'completed', 'failed', 'cancelled'
         )),
-    CONSTRAINT chk_requested_workers CHECK (requested_workers > 0),
+    CONSTRAINT chk_requested_workers
+        CHECK (requested_workers IS NULL OR requested_workers > 0),
     CONSTRAINT chk_train_ratio
         CHECK (train_ratio IS NULL OR (train_ratio > 0 AND train_ratio < 1))
 );
@@ -560,21 +592,33 @@ su `node_id`, publica directamente en CockroachDB. El intervalo se puede
 ajustar con `--heartbeat-interval`; el valor predeterminado es 3
 segundos.
 
-### Frontend
+### Interfaz web
 
-Todavía no hay una interfaz conectada a la API. Como referencia de diseño
-existe `frontend/prototipo/distributed-ml-prototipo.html`, una sola
-página que se abre con doble clic, sin servidor. Tiene cuatro vistas
-(Panel, Clúster, Entrenar y Resultados) y usa datos de las pruebas, no de
-la API.
+FastAPI sirve `frontend/` en <http://127.0.0.1:8000/>, en el mismo origen
+que la API, con `Cache-Control: no-cache` para que el navegador nunca mezcle
+archivos viejos y nuevos tras una actualización. Se actualiza por polling
+cada 3 segundos.
 
-Estilo del prototipo, que servirá de base para el frontend real:
+Hay dos formas de ver el proyecto. La del **usuario** es transparente: abre
+en Entrenar y solo muestra Entrenar y Resultados. El botón **Vista técnica**
+cambia a Panel, Clúster y Actividad, con el estado real del sistema; el
+mismo botón, que pasa a decir "Volver al entrenamiento", regresa.
+
+| Vista | Modo | Qué muestra |
+|---|---|---|
+| Entrenar | Usuario | Subir o elegir un CSV, columna objetivo, parámetros y lanzar el Job; usa todos los Workers activos |
+| Resultados | Usuario | Estado de cada Job, accuracy, loss, curva de pérdida, matriz de confusión, Tasks y el botón Descargar modelo |
+| Panel | Técnica | Salud del clúster, Workers, coordinador y Jobs recientes (`/cluster`) |
+| Clúster | Técnica | Cada nodo CockroachDB según su API de administración (listo, versión, latencia, rangos con problemas), Workers con sus métricas y reparto de particiones (`/cluster/technical-status`) |
+| Actividad | Técnica | Eventos de CockroachDB y los últimos Jobs, Tasks y Datasets (`/cluster/technical-status`) |
+
+Estilo:
 
 | Elemento | Valor |
 |---|---|
-| Fondo | Midnight Black `#050505` |
+| Fondo | Blanco con un leve tono azul (`#F4F6FA`) |
 | Acento | Electric Cobalt `#173FAD` en botones y destellos |
-| Superficies | Vidrio esmerilado (`backdrop-filter: blur`) sobre destellos azul y rojo |
+| Superficies | Vidrio blanco esmerilado (`backdrop-filter: blur`) sobre destellos azul y rojo muy suaves |
 | Tipografía | Instrument Serif para títulos (una parte en cursiva) e Inter para el texto |
 | Formas | Bordes de 28 px, botones tipo píldora y control segmentado al estilo iOS |
 
@@ -585,6 +629,7 @@ Endpoints disponibles:
 | Método y ruta | Resultado |
 |---|---|
 | `GET /health` | Lee la tabla `nodes` (no solo `SELECT 1`), así que también detecta la pérdida de quórum. Responde HTTP 503 en unos 5 s si la DB no está disponible. |
+| `GET /nodes` | Lista los Workers con sus métricas, si su Heartbeat es reciente y cuál es el coordinador. |
 | `POST /nodes` | Registra un Worker y devuelve el registro con su `node_id`. |
 | `POST /nodes/{node_id}/heartbeat` | Marca ese Worker `online` y actualiza su Heartbeat por la API. El cliente Worker actual no usa esta ruta después del registro. |
 | `POST /datasets` | Sube un CSV (multipart, campo `file`; campo `name` opcional). Devuelve el registro con `row_count`, `column_count` y la lista `columns`. Responde 422 si el archivo no cumple las reglas de abajo. |
@@ -592,10 +637,14 @@ Endpoints disponibles:
 | `GET /datasets/{dataset_id}` | Devuelve los metadatos de un dataset. |
 | `GET /datasets/{dataset_id}/columns` | Lee el encabezado del archivo, para elegir la columna objetivo. Responde 409 si el archivo no está en este host. |
 | `DELETE /datasets/{dataset_id}` | Borra el registro y el archivo. Responde 409 si algún Job usa el dataset. |
-| `POST /jobs` | Crea un Job `pending`. Responde 422 si `requested_workers` supera los Workers en línea. Antes de crearlo prepara el dataset completo (ver abajo) y responde 422 si no sirve para entrenar. Devuelve el Job y un resumen `preparation` con columnas, clases y filas de train/test. |
+| `POST /jobs` | Crea un Job `pending` que usará todos los Workers activos. Antes de crearlo prepara el dataset completo (ver abajo) y responde 422 si no sirve para entrenar. Devuelve el Job y un resumen `preparation` con columnas, clases y filas de train/test. |
+| `GET /jobs` | Lista los Jobs, el más reciente primero. |
 | `GET /jobs/{job_id}` | Devuelve un Job. |
 | `GET /jobs/{job_id}/tasks` | Devuelve las Tasks que el Scheduler creó para el Job. |
+| `GET /jobs/{job_id}/model` | Descarga el modelo entrenado (`modelo-<dataset>-<job>.json`). Responde 404 sin resultado y 409 si el resultado es anterior al modelo descargable. |
 | `GET /jobs/{job_id}/result` | Devuelve el resultado del Job: `accuracy` y `loss` del conjunto de test, `duration_seconds` y `metrics`. Responde 404 mientras el Job no tenga resultado. |
+| `GET /cluster` | Resumen para el Panel: qué nodos CockroachDB aceptan SQL, replicación, liderazgo y Workers en línea. |
+| `GET /cluster/technical-status` | Vista técnica completa: estado de cada nodo según la API de administración de CockroachDB, rangos por nodo, eventos, liderazgo, Workers y registros recientes. Cachea 15 s. |
 
 Reglas de validación de los CSV:
 
@@ -615,10 +664,11 @@ ejecuta al crear un Job:
 
 | Paso | Regla |
 |---|---|
-| Algoritmo | Solo `logistic_regression` (valor por defecto). |
+| Algoritmo | Solo `logistic-regression` (valor por defecto). |
 | Columna objetivo | Debe existir y tener entre 2 y 20 clases, con al menos 2 filas por clase. Sirve para clasificación binaria y multiclase. |
 | Valores faltantes | Se rechaza el dataset si hay celdas vacías o con `NA`, `N/A`, `NaN`, `null`, `None` o `?`; el error dice en qué columnas. |
 | Columnas numéricas | Se normalizan (z-score) con la media y la desviación del conjunto de entrenamiento. Una columna constante queda en 0. |
+| Identificadores | Se excluyen solas las columnas de números enteros consecutivos, uno distinto por fila (como `PassengerId`), si el dataset tiene al menos 10 filas. No aportan información y el modelo no las espera al predecir. El resumen del Job las lista en `excluded_columns`. |
 | Columnas de texto | Se codifican en one-hot con las categorías vistas en entrenamiento (máximo 50). Una columna con más valores distintos se rechaza por parecer un identificador. |
 | División train/test | Estratificada por clase, con `train_ratio` (por defecto 0.8) y `seed` (por defecto 42). La misma combinación produce siempre la misma división. |
 
@@ -637,6 +687,32 @@ responde 422.
 Los valores iniciales del documento de diseño (0.01 y 20 épocas) casi no
 reducen la pérdida con gradiente descendente sobre todo el conjunto; con
 0.5 y 100 épocas el modelo converge en los datasets de prueba.
+
+### Usar el modelo entrenado en otro proyecto
+
+En Resultados, **Descargar modelo** baja un archivo como
+`modelo-titanic-train-data-777fef44.json`. Para usarlo, copiar ese archivo
+y `examples/predecir.py` al proyecto; solo hace falta Python 3.10 o
+posterior:
+
+```powershell
+python predecir.py modelo.json datos.csv predicciones.csv
+```
+
+`predicciones.csv` repite las filas con las columnas `prediccion` y
+`prob_<clase>`. Desde código:
+
+```python
+from predecir import cargar_modelo, predecir_fila
+
+modelo = cargar_modelo("modelo.json")
+clase, probabilidades = predecir_fila(modelo, {"Sex": "1", "Age": "0.3", ...})
+```
+
+Las filas deben traer las columnas de `input_columns`; la columna objetivo
+y las excluidas se ignoran. El archivo aplica la misma normalización y
+codificación que el entrenamiento, así que predice exactamente igual que
+el modelo entrenado (hay pruebas que lo verifican).
 
 ### Modelo y entrenamiento local de referencia
 
@@ -659,7 +735,7 @@ Contenido de `results.metrics` al terminar un Job:
 | `training` | `epochs`, `learning_rate`, `partitions`, `workers`, `train_rows`, `test_rows` usados de verdad |
 | `train_loss_by_epoch` | Pares `[época, loss]`, hasta 200 puntos |
 | `class_labels`, `feature_names` | Orden de las clases y de las columnas codificadas |
-| `model` | Pesos y bias finales; son pequeños, así que no se escribe un archivo aparte y `model_path` queda vacío |
+| `model` | El modelo descargable (formato `distributed-ml/logistic-regression@1`): columnas de entrada, columnas excluidas, medias y desviaciones, categorías, clases, pesos y bias. Es pequeño, así que vive en la base de datos y `model_path` queda vacío |
 
 `duration_seconds` mide desde que el coordinador empieza el Job hasta que
 termina la última época.
@@ -734,9 +810,9 @@ python -m unittest discover -s tests -p "test_*.py" -v
 - Los CSV se guardan en el disco local del Backend: CockroachDB replica
   sus metadatos, pero no el archivo. Si se pierde el disco del Backend,
   se pierden los CSV aunque la base de datos siga intacta.
-- Si hay menos Workers elegibles que `requested_workers`, el Job espera
-  en `pending`, sin Tasks ni asignaciones parciales, y el Scheduler lo
-  reintenta cada segundo (`contrato.md` §17.1). Todos los Workers miden la
+- El Job usa todos los Workers elegibles; si no hay ninguno, espera en
+  `pending`, sin Tasks, y el Scheduler lo reintenta cada segundo
+  (`contrato.md` §17.1). Todos los Workers miden la
   CPU del equipo completo: si el equipo está ocupado publican `0.0`
   núcleos disponibles y quedan fuera durante ese ciclo, lo que solo
   retrasa el arranque. Los umbrales de CPU/RAM siguen pendientes de
