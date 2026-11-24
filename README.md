@@ -19,7 +19,8 @@ distribuido todavía no están implementados.
 | Registro inicial de Workers | Implementado con `POST /nodes`. |
 | Heartbeat y métricas de Workers | Implementados: cada Worker publica directamente en CockroachDB cada 3 segundos por defecto. |
 | Lease persistente de liderazgo | Tabla y operaciones de repositorio implementadas; no hay elección automática. |
-| Frontend y gestión de datasets/Jobs | No implementados. |
+| Carga de datasets CSV | Implementada: `POST /datasets` recibe el archivo, lo valida, lo guarda en `backend/storage/datasets/` y registra sus metadatos. |
+| Frontend | No implementado. |
 | Scheduler, ejecución ML distribuida y recuperación de Tasks | Objetivos arquitectónicos; todavía no son flujos operativos. |
 
 El diseño técnico de elección de coordinador, fencing, comunicación
@@ -120,8 +121,9 @@ El flujo integral esperado es el siguiente. Los pasos de carga,
 planificación, ejecución y resultados son objetivos de arquitectura; no
 están expuestos por los módulos actuales.
 
-1. El usuario carga un dataset; una futura API validará el archivo y
-   guardará sus metadatos en `datasets`.
+1. El usuario carga un CSV con `POST /datasets`. La API lo valida, lo
+   guarda en el disco local del Backend y registra sus metadatos en
+   `datasets` (implementado).
 2. El usuario configura un Job; la API prevista registrará parámetros,
    algoritmo, columna objetivo y cantidad de Workers en `jobs`.
 3. El coordinador preparará particiones y creará Tasks en `tasks`.
@@ -150,7 +152,8 @@ están expuestos por los módulos actuales.
 | Biblioteca estándar de Python | Cliente HTTP del Worker y obtención de métricas del sistema. |
 | `unittest` | Pruebas de integración del repositorio de liderazgo. |
 
-`backend/requirements.txt` declara FastAPI, Uvicorn y Psycopg. PyTorch
+`backend/requirements.txt` declara FastAPI, Uvicorn, Psycopg y
+`python-multipart` (necesario para recibir archivos). PyTorch
 forma parte del diseño previsto para el entrenamiento, pero no está
 incluido en las dependencias actuales ni se ejecuta en este repositorio.
 El frontend previsto utilizará HTML, CSS y JavaScript sin framework,
@@ -162,6 +165,7 @@ pero todavía no contiene archivos.
 .
 ├── backend/
 │   ├── main.py
+│   ├── dataset_storage.py      # Guarda, valida y borra los CSV subidos
 │   ├── requirements.txt
 │   ├── api/
 │   │   ├── nodes.py
@@ -193,9 +197,11 @@ pero todavía no contiene archivos.
 ```
 
 `backend/api/nodes.py` implementa el registro y el endpoint HTTP de
-Heartbeat. Los módulos de `datasets`, `jobs`, `cluster` y `training`,
-así como `coordinator/` y `workers/training_engine.py`, son marcadores
-sin esa funcionalidad. `backend/database/schema.sql` es un placeholder;
+Heartbeat. `backend/api/datasets.py` implementa la carga y gestión de
+CSV, apoyado en `backend/dataset_storage.py` para el manejo de archivos.
+Los módulos de `cluster` y `training`, `coordinator/partitioner.py`,
+`coordinator/aggregator.py` y `workers/training_engine.py` son
+marcadores sin funcionalidad. `backend/database/schema.sql` es un placeholder;
 el esquema integral de referencia está en este README. La migración de
 liderazgo sirve para aplicar esa tabla de forma aditiva a una base ya
 existente; no sustituye el DDL de instalación limpia de abajo.
@@ -439,6 +445,30 @@ Endpoints disponibles:
 | `GET /health` | Lee la tabla `nodes` (no solo `SELECT 1`), así que también detecta la pérdida de quórum. Responde HTTP 503 en unos 5 s si la DB no está disponible. |
 | `POST /nodes` | Registra un Worker y devuelve el registro con su `node_id`. |
 | `POST /nodes/{node_id}/heartbeat` | Marca ese Worker `online` y actualiza su Heartbeat por la API. El cliente Worker actual no usa esta ruta después del registro. |
+| `POST /datasets` | Sube un CSV (multipart, campo `file`; campo `name` opcional). Devuelve el registro con `row_count`, `column_count` y la lista `columns`. Responde 422 si el archivo no cumple las reglas de abajo. |
+| `GET /datasets` | Lista los datasets registrados. |
+| `GET /datasets/{dataset_id}` | Devuelve los metadatos de un dataset. |
+| `GET /datasets/{dataset_id}/columns` | Lee el encabezado del archivo, para elegir la columna objetivo. Responde 409 si el archivo no está en este host. |
+| `DELETE /datasets/{dataset_id}` | Borra el registro y el archivo. Responde 409 si algún Job usa el dataset. |
+
+Reglas de validación de los CSV:
+
+- Extensión `.csv`, codificación UTF-8 (con o sin BOM), separador coma.
+- Primera fila con los nombres de columna: al menos 2, sin nombres vacíos
+  ni repetidos.
+- Al menos 2 filas de datos, todas con el mismo número de valores que el
+  encabezado. Las filas vacías se ignoran.
+- Tamaño máximo de 100 MB, ajustable con la variable `DATASET_MAX_BYTES`.
+
+Los tipos de datos, los valores faltantes y la columna objetivo se
+validan al preparar el entrenamiento, no al subir el archivo. Un archivo
+rechazado no queda guardado en disco.
+
+Subir un CSV desde PowerShell:
+
+```powershell
+curl.exe -F "file=@C:\ruta\datos.csv" -F "name=Mi dataset" http://127.0.0.1:8000/datasets
+```
 
 Comprobar el backend desde PowerShell:
 
@@ -482,7 +512,10 @@ python -m unittest discover -s tests -p "test_*.py" -v
   fecha indicada (unos 7 días después de crear el clúster). Antes de la
   demo, instalar una licencia gratuita de Cockroach Labs o recrear el
   clúster.
-- No hay frontend ni API operativa para datasets, Jobs, Tasks o resultados.
+- No hay frontend ni API operativa para resultados.
+- Los CSV se guardan en el disco local del Backend: CockroachDB replica
+  sus metadatos, pero no el archivo. Si se pierde el disco del Backend,
+  se pierden los CSV aunque la base de datos siga intacta.
 - Los módulos de coordinación y entrenamiento no implementan Scheduler,
   elección automática, comunicación Worker-a-Worker, ejecución ML,
   agregación ni recuperación de tareas.

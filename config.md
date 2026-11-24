@@ -221,7 +221,7 @@ Un HTTP `200 OK` y el indicador `database: available` confirman que FastAPI est�
 - **Contenedores:** recrearlos con `docker compose up -d`.
 - **Datos CockroachDB:** viven en volúmenes Docker, no dentro de los archivos del repositorio. Copiar la carpeta del proyecto no copia estos volúmenes. Docker Compose puede usar volúmenes existentes o crear volúmenes nuevos según el nombre del proyecto/configuración; verificar los datos antes de asumir que la base está presente.
 - **`.env`:** archivo local no versionado. Si el proyecto necesita variables adicionales, crear el `.env` a partir de `.env.example` y rellenarlo; no compartir secretos.
-- **Archivos CSV/datasets locales:** pueden estar dentro de `backend/storage/`; confirmar política de respaldo/versionado y no subir datos sensibles.
+- **Archivos CSV/datasets locales:** los CSV subidos con `POST /datasets` quedan en `backend/storage/datasets/`, que está en `.gitignore`. Al mover el proyecto hay que copiar esa carpeta junto con los volúmenes de CockroachDB; si no, los registros de `datasets` apuntarán a archivos inexistentes. No subir datos sensibles.
 
 ## 12. Reiniciar el entorno en el día a día
 
@@ -246,4 +246,4 @@ docker compose down
 
 ## 13. Estado y límites de esta guía
 
-Esta guía cubre la configuración local actual del backend y CockroachDB. No instala ni configura Workers, el proceso de entrenamiento, el scheduler, endpoints funcionales de datasets/jobs, ni despliegue de FastAPI en contenedor; esas piezas se implementarán en tareas posteriores.
+Esta guía cubre la configuración local actual del backend y CockroachDB. No instala ni configura Workers, el proceso de entrenamiento, el scheduler, ni despliegue de FastAPI en contenedor; esas piezas se implementarán en tareas posteriores.

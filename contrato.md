@@ -266,7 +266,7 @@ Reglas:
 - No debe eliminar archivos del sistema de almacenamiento.
 - No debe implementar eliminación en cascada.
 
-La eliminación física del archivo, si posteriormente se requiere, será responsabilidad de la capa de gestión de archivos.
+La eliminación física del archivo es responsabilidad de la capa de gestión de archivos (`backend/dataset_storage.py`). El endpoint `DELETE /datasets/{dataset_id}` borra primero el registro con `delete_dataset` y, solo si tuvo éxito, el archivo con `dataset_storage.delete_file`.
 
 ---
 
