@@ -3,7 +3,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 import dataset_storage
 from coordinator.preprocessing import (
@@ -13,6 +13,7 @@ from coordinator.preprocessing import (
     prepare_dataset,
 )
 from database import repository
+from workers.training_engine import DEFAULT_EPOCHS, DEFAULT_LEARNING_RATE, MAX_EPOCHS
 
 router = APIRouter()
 
@@ -50,12 +51,19 @@ class TaskResponse(BaseModel):
     error_message: str | None
 
 
+class TrainingParameters(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    learning_rate: float = Field(default=DEFAULT_LEARNING_RATE, gt=0, le=10)
+    epochs: int = Field(default=DEFAULT_EPOCHS, ge=1, le=MAX_EPOCHS)
+
+
 class JobCreate(BaseModel):
     dataset_id: UUID
     algorithm: Literal["logistic_regression"] = "logistic_regression"
     target_column: str = Field(min_length=1)
     requested_workers: int = Field(gt=0)
-    parameters: dict[str, Any] = Field(default_factory=dict)
+    parameters: TrainingParameters = Field(default_factory=TrainingParameters)
     train_ratio: float = Field(default=DEFAULT_TRAIN_RATIO, gt=0, lt=1)
     seed: int = DEFAULT_SEED
 
@@ -97,7 +105,8 @@ def create_job(job: JobCreate) -> dict[str, Any]:
         target_column=job.target_column.strip(),
         requested_workers=job.requested_workers,
         status="pending",
-        parameters=job.parameters,
+        # Stored with defaults filled in, so the Job records exactly what runs.
+        parameters=job.parameters.model_dump(),
         train_ratio=job.train_ratio,
         seed=job.seed,
     )

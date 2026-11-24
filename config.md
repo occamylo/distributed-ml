@@ -58,8 +58,11 @@ Con el entorno virtual activado y desde la raíz:
 
 ```bash
 python -m pip install --upgrade pip
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -r backend/requirements.txt
 ```
+
+La segunda línea instala PyTorch solo para CPU (unos 200 MB). Sin ella, en Linux `pip` descargaría la versión con CUDA, de varios GB, que el proyecto no usa. Al importarlo, PyTorch avisa que no encuentra NumPy; no hace falta instalarlo.
 
 Si se abre una nueva terminal, volver a activar el entorno:
 

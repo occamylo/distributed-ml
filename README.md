@@ -21,6 +21,7 @@ distribuido todavía no están implementados.
 | Lease persistente de liderazgo | Tabla y operaciones de repositorio implementadas; no hay elección automática. |
 | Carga de datasets CSV | Implementada: `POST /datasets` recibe el archivo, lo valida, lo guarda en `backend/storage/datasets/` y registra sus metadatos. |
 | Preparación de datos | Implementada: `POST /jobs` valida el target, codifica, normaliza y separa train/test estratificado antes de crear el Job. |
+| Modelo Logistic Regression (PyTorch) | Implementado para un solo proceso: softmax binario/multiclase, gradiente por partición, agregación ponderada y evaluación. El entrenamiento distribuido en Workers todavía no está conectado. |
 | Frontend | No implementado. |
 | Scheduler, ejecución ML distribuida y recuperación de Tasks | Objetivos arquitectónicos; todavía no son flujos operativos. |
 
@@ -153,12 +154,12 @@ están expuestos por los módulos actuales.
 | CockroachDB | Persistencia SQL distribuida del proyecto. |
 | Docker Compose | Ejecución local de los tres contenedores CockroachDB. |
 | Biblioteca estándar de Python | Cliente HTTP del Worker y obtención de métricas del sistema. |
-| `unittest` | Pruebas de integración del repositorio de liderazgo. |
+| PyTorch (CPU) | Logistic Regression: gradientes con autograd, actualización y evaluación. |
+| `unittest` | Pruebas de integración del liderazgo y pruebas unitarias de preparación y entrenamiento. |
 
-`backend/requirements.txt` declara FastAPI, Uvicorn, Psycopg y
-`python-multipart` (necesario para recibir archivos). PyTorch
-forma parte del diseño previsto para el entrenamiento, pero no está
-incluido en las dependencias actuales ni se ejecuta en este repositorio.
+`backend/requirements.txt` declara FastAPI, Uvicorn, Psycopg,
+`python-multipart` (necesario para recibir archivos) y PyTorch. Se usa
+la versión de PyTorch solo para CPU; ver el paso de instalación.
 El frontend previsto utilizará HTML, CSS y JavaScript sin framework,
 pero todavía no contiene archivos.
 
@@ -179,6 +180,7 @@ pero todavía no contiene archivos.
 │   ├── coordinator/
 │   │   ├── scheduler.py
 │   │   ├── preprocessing.py   # Target, codificación, normalización y split
+│   │   ├── local_training.py  # Entrenamiento local de referencia (baseline)
 │   │   ├── partitioner.py
 │   │   └── aggregator.py
 │   ├── database/
@@ -191,10 +193,11 @@ pero todavía no contiene archivos.
 │   │   └── datasets/
 │   ├── tests/
 │   │   ├── test_leadership_repository.py
-│   │   └── test_preprocessing.py
+│   │   ├── test_preprocessing.py
+│   │   └── test_training_engine.py
 │   └── workers/
 │       ├── worker.py
-│       └── training_engine.py
+│       └── training_engine.py   # Logistic Regression en PyTorch
 ├── docs/
 │   └── distributed-coordination-architecture.md
 ├── frontend/                 # Directorio vacío; UI no implementada
@@ -205,8 +208,11 @@ pero todavía no contiene archivos.
 Heartbeat. `backend/api/datasets.py` implementa la carga y gestión de
 CSV, apoyado en `backend/dataset_storage.py` para el manejo de archivos.
 `backend/coordinator/preprocessing.py` prepara los datos para el
-entrenamiento y `backend/api/jobs.py` lo usa al crear un Job. Los módulos de `cluster` y `training`, `coordinator/partitioner.py`,
-`coordinator/aggregator.py` y `workers/training_engine.py` son
+entrenamiento y `backend/api/jobs.py` lo usa al crear un Job.
+`backend/workers/training_engine.py` implementa el modelo y
+`backend/coordinator/local_training.py` el entrenamiento local de
+referencia. Los módulos de `cluster` y `training`,
+`coordinator/partitioner.py` y `coordinator/aggregator.py` son
 marcadores sin funcionalidad. `backend/database/schema.sql` es un placeholder;
 el esquema integral de referencia está en este README. La migración de
 liderazgo sirve para aplicar esa tabla de forma aditiva a una base ya
@@ -362,8 +368,14 @@ Desde la raíz del repositorio:
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -r backend\requirements.txt
 ```
+
+La primera instalación toma PyTorch solo para CPU (unos 200 MB). Sin
+ese paso, en Linux `pip` descargaría la versión con CUDA, de varios GB.
+PyTorch muestra un aviso de que no encuentra NumPy; el proyecto no lo
+necesita.
 
 ### Iniciar CockroachDB y crear el esquema
 
@@ -487,6 +499,50 @@ ejecuta al crear un Job:
 
 El conjunto de prueba nunca participa en el cálculo de estadísticas ni de
 categorías, para que no haya fuga de información hacia el entrenamiento.
+
+Parámetros de entrenamiento (`parameters` en `POST /jobs`). Se guardan
+en el Job con los valores por defecto ya aplicados; cualquier otra clave
+responde 422.
+
+| Parámetro | Por defecto | Rango |
+|---|---|---|
+| `learning_rate` | 0.5 | Mayor que 0, hasta 10 |
+| `epochs` | 100 | 1 a 10000 |
+
+Los valores iniciales del documento de diseño (0.01 y 20 épocas) casi no
+reducen la pérdida con gradiente descendente sobre todo el conjunto; con
+0.5 y 100 épocas el modelo converge en los datasets de prueba.
+
+### Modelo y entrenamiento local de referencia
+
+`backend/workers/training_engine.py` implementa Logistic Regression con
+softmax, que cubre binario y multiclase con una sola fórmula. Separa las
+operaciones del entrenamiento distribuido:
+
+| Función | Quién la usará | Qué hace |
+|---|---|---|
+| `compute_gradient` | Cada Worker | Gradiente medio de su partición con los pesos actuales, más el número de filas. |
+| `aggregate_gradients` | Coordinador | Promedio ponderado `Σ nᵢ·Gᵢ / Σ nᵢ`. |
+| `apply_update` | Coordinador | `w ← w − learning_rate · G`. |
+| `evaluate` | Coordinador | Loss, accuracy y matriz de confusión sobre el conjunto de prueba. |
+
+Los pesos empiezan en cero y los gradientes son de todo el lote, así que
+el entrenamiento es determinista. Como el promedio ponderado de los
+gradientes por partición es igual al gradiente de todo el conjunto, una
+época distribuida produce los mismos pesos que una local; hay una prueba
+unitaria que lo verifica.
+
+El entrenamiento local de referencia corre todo en un proceso, con la
+misma preparación y las mismas operaciones. Desde `backend/`:
+
+```powershell
+python -m coordinator.local_training --csv C:\ruta\datos.csv --target y
+python -m coordinator.local_training --dataset-id <uuid> --target y --learning-rate 0.5 --epochs 100
+```
+
+Imprime en JSON el resumen de la preparación, la pérdida por época, las
+métricas de train y test (accuracy, loss y matriz de confusión) y la
+duración.
 
 Subir un CSV desde PowerShell:
 
