@@ -25,6 +25,7 @@ from database.repository import (
     update_node_metrics,
 )
 from workers.coordination import WorkerCoordination
+from workers.task_executor import TaskExecutor
 
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 3.0
 REQUEST_TIMEOUT_SECONDS = 10
@@ -380,6 +381,7 @@ def run_worker(
 
     pool_initialized = False
     coordination: WorkerCoordination | None = None
+    task_executor: TaskExecutor | None = None
     scheduler: Scheduler | None = None
     try:
         while True:
@@ -424,7 +426,12 @@ def run_worker(
                     )
                     time.sleep(heartbeat_interval_seconds)
                     continue
-                coordination = WorkerCoordination(UUID(node_id), advertised_host)
+                task_executor = TaskExecutor(UUID(node_id))
+                coordination = WorkerCoordination(
+                    UUID(node_id),
+                    advertised_host,
+                    task_executor=task_executor,
+                )
                 coordination.start()
                 scheduler = Scheduler(coordination)
                 scheduler.start()
@@ -452,7 +459,9 @@ def run_worker(
                     UUID(node_id),
                     cpu_available_cores,
                     ram_available_mb,
-                    active_tasks=0,
+                    active_tasks=(
+                        task_executor.active_tasks if task_executor is not None else 0
+                    ),
                 )
             except (OperationalError, PoolTimeout, SerializationFailure) as exc:
                 logger.warning(

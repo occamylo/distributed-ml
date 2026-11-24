@@ -1,6 +1,7 @@
 import logging
 import math
 import threading
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
@@ -19,6 +20,9 @@ from database.repository import (
     list_tasks_by_job,
     update_job_as_leader,
 )
+from coordinator.job_data import PreparedDatasetCache
+from coordinator.partitioner import build_partitions, distribute_tasks, partition_count
+from coordinator.preprocessing import DatasetPreparationError
 from workers.coordination import WorkerCoordination
 
 DEFAULT_SCHEDULER_INTERVAL_SECONDS = 1.0
@@ -38,6 +42,7 @@ class Scheduler:
 
         self._coordination = coordination
         self._interval_seconds = interval_seconds
+        self._prepared_datasets = PreparedDatasetCache()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -111,13 +116,15 @@ class Scheduler:
 
         tasks = list_tasks_by_job(job_id)
         if not tasks:
-            partitions = _build_partitions(dataset.get("row_count"), len(workers))
-            if partitions is None:
-                logger.error(
-                    "Skipping Job %s because its Dataset row count is invalid.",
-                    job_id,
-                )
-                return True
+            # Only the training split is distributed; the test split stays
+            # with the Coordinator for the final evaluation.
+            try:
+                train_rows = len(self._prepared_datasets.get(job).y_train)
+            except DatasetPreparationError as exc:
+                return self._fail_job(job, epoch, f"Dataset preparation failed: {exc}")
+            partitions = build_partitions(
+                train_rows, partition_count(train_rows, len(workers))
+            )
             if not self._retains_leadership(epoch):
                 return False
             created_tasks = create_tasks_for_job(
@@ -131,20 +138,12 @@ class Scheduler:
                 return self._retains_leadership(epoch)
             tasks = created_tasks
 
-        if len(tasks) > requested_workers:
-            logger.error(
-                "Skipping Job %s because it has %s Tasks for only %s requested Workers.",
-                job_id,
-                len(tasks),
-                requested_workers,
-            )
-            return True
-
-        assigned_node_ids = {
-            task.get("node_id")
-            for task in tasks
-            if isinstance(task.get("node_id"), UUID)
-        }
+        # A Job may have several Tasks per Worker; the limit applies to the
+        # number of distinct Workers that take part.
+        task_counts = Counter(
+            task["node_id"] for task in tasks if isinstance(task.get("node_id"), UUID)
+        )
+        assigned_node_ids = set(task_counts)
         if len(assigned_node_ids) > requested_workers:
             logger.error(
                 "Skipping Job %s because its Tasks exceed the requested Worker count.",
@@ -152,24 +151,26 @@ class Scheduler:
             )
             return True
 
-        available_node_ids = [
-            worker["node_id"]
-            for worker in workers
-            if worker["node_id"] not in assigned_node_ids
-        ][: max(0, requested_workers - len(assigned_node_ids))]
-        pending_tasks = [
-            task
-            for task in tasks
-            if task.get("status") == "pending" and task.get("node_id") is None
+        # Workers already in the Job keep receiving Tasks; new Workers join
+        # only up to the requested count. ``workers`` is ordered by preference.
+        eligible_ids = [worker["node_id"] for worker in workers]
+        participants = [node for node in eligible_ids if node in assigned_node_ids]
+        participants += [node for node in eligible_ids if node not in assigned_node_ids][
+            : max(0, requested_workers - len(assigned_node_ids))
+        ]
+        pending_task_ids = [
+            task["task_id"]
+            for task in sorted(tasks, key=lambda task: task["partition_index"])
+            if task.get("status") == "pending"
+            and task.get("node_id") is None
+            and isinstance(task.get("task_id"), UUID)
         ]
 
-        for task, worker_node_id in zip(pending_tasks, available_node_ids):
+        for task_id, worker_node_id in distribute_tasks(
+            pending_task_ids, participants, task_counts
+        ):
             if not self._retains_leadership(epoch):
                 return False
-            task_id = task.get("task_id")
-            if not isinstance(task_id, UUID):
-                logger.error("Skipping a Task with an invalid ID in Job %s.", job_id)
-                continue
 
             assigned_task = assign_task(
                 task_id,
@@ -237,6 +238,25 @@ class Scheduler:
             )
         return True
 
+    def _fail_job(self, job: Record, epoch: int, reason: str) -> bool:
+        if not self._retains_leadership(epoch):
+            return False
+        updated_job = update_job_as_leader(
+            job["job_id"],
+            "pending",
+            {
+                "status": "failed",
+                "error_message": reason[:1000],
+                "completed_at": datetime.now(timezone.utc),
+            },
+            self._coordination.node_id,
+            epoch,
+            DEFAULT_CLUSTER_ID,
+        )
+        if updated_job is not None:
+            logger.error("Job %s failed: %s", job["job_id"], reason)
+        return True
+
     def _eligible_workers(self, requested_workers: int) -> list[Record]:
         eligible: list[Record] = []
         for node in list_nodes_with_fresh_metrics():
@@ -298,28 +318,3 @@ class Scheduler:
             and self._current_leader_epoch() == epoch
         )
 
-
-def _build_partitions(
-    row_count: Any,
-    worker_count: int,
-) -> list[dict[str, int | None]] | None:
-    if worker_count <= 0:
-        return []
-    if row_count is not None and (
-        not isinstance(row_count, int)
-        or isinstance(row_count, bool)
-        or row_count < 0
-    ):
-        return None
-    if row_count is None:
-        rows_per_partition: list[int | None] = [None] * worker_count
-    else:
-        base_rows, extra_rows = divmod(row_count, worker_count)
-        rows_per_partition = [
-            base_rows + (1 if index < extra_rows else 0)
-            for index in range(worker_count)
-        ]
-    return [
-        {"partition_index": index, "rows_assigned": rows_assigned}
-        for index, rows_assigned in enumerate(rows_per_partition)
-    ]

@@ -21,9 +21,11 @@ distribuido todavía no están implementados.
 | Lease persistente de liderazgo | Tabla y operaciones de repositorio implementadas; no hay elección automática. |
 | Carga de datasets CSV | Implementada: `POST /datasets` recibe el archivo, lo valida, lo guarda en `backend/storage/datasets/` y registra sus metadatos. |
 | Preparación de datos | Implementada: `POST /jobs` valida el target, codifica, normaliza y separa train/test estratificado antes de crear el Job. |
-| Modelo Logistic Regression (PyTorch) | Implementado para un solo proceso: softmax binario/multiclase, gradiente por partición, agregación ponderada y evaluación. El entrenamiento distribuido en Workers todavía no está conectado. |
+| Modelo Logistic Regression (PyTorch) | Implementado: softmax binario/multiclase, gradiente por partición, agregación ponderada y evaluación; entrenamiento local de referencia. |
+| Ejecución de Tasks en Workers | Implementada para una ronda: cada Worker calcula el gradiente de su partición de train cuando el coordinador se lo pide, con verificación de `attempt_id` y época del líder. El ciclo completo de épocas todavía no está conectado. |
 | Frontend | No implementado. |
-| Scheduler, ejecución ML distribuida y recuperación de Tasks | Objetivos arquitectónicos; todavía no son flujos operativos. |
+| Scheduler | Implementado en el Worker líder: elige Workers por capacidad, reparte las filas de train en más Tasks que Workers (3 por Worker) y las asigna de forma equilibrada. |
+| Ciclo de entrenamiento distribuido y recuperación de Tasks | Pendientes. |
 
 El diseño técnico de elección de coordinador, fencing, comunicación
 entre Workers y recuperación está descrito en
@@ -113,15 +115,14 @@ La CPU disponible se estima con contadores del sistema operativo; en
 Linux se limita a la cuota cgroup cuando está disponible. La RAM
 disponible se obtiene del sistema operativo y se limita a memoria cgroup
 en Linux cuando aplica. Si una medición no puede obtenerse de forma
-fiable, se guarda `NULL`. `active_tasks` es `0` porque no existe un
-ejecutor de Tasks. Estas métricas son observaciones del sistema, no
+fiable, se guarda `NULL`. `active_tasks` es el número de gradientes
+que el Worker está calculando en ese momento. Estas métricas son observaciones del sistema, no
 garantías de elegibilidad para coordinar.
 
 ### Flujo de entrenamiento previsto
 
-El flujo integral esperado es el siguiente. Los pasos de carga,
-planificación, ejecución y resultados son objetivos de arquitectura; no
-están expuestos por los módulos actuales.
+El flujo integral es el siguiente; cada paso indica si ya está
+implementado.
 
 1. El usuario carga un CSV con `POST /datasets`. La API lo valida, lo
    guarda en el disco local del Backend y registra sus metadatos en
@@ -130,19 +131,61 @@ están expuestos por los módulos actuales.
    (valida el target, codifica, normaliza y separa train/test) y, si
    todo es válido, registra parámetros, algoritmo, columna objetivo y
    cantidad de Workers en `jobs` (implementado).
-3. El coordinador preparará particiones y creará Tasks en `tasks`.
-4. La membresía y las métricas disponibles estarán en `nodes`. Un
-   Scheduler futuro elegirá Workers; actualmente no existe esa selección.
-5. Las operaciones de lease permiten adquirir y validar liderazgo desde
-   el repositorio. La elección automática de un Worker coordinador aún
-   no existe.
-6. El coordinador distribuirá Tasks a los Workers y controlará intentos,
-   leases y época del coordinador.
-7. Los Workers procesarán sus particiones; el proceso actual solo
-   registra y publica Heartbeat/métricas.
-8. El coordinador recibirá y agregará los resultados de las particiones.
-9. El resultado final se almacenará en `results`.
-10. Una futura interfaz consultará el estado del Job y sus métricas.
+3. Los Workers eligen un coordinador con el lease de `cluster_leadership`
+   (implementado).
+4. El Scheduler del coordinador elige Workers por sus métricas en
+   `nodes`, prepara el dataset y reparte **solo las filas de train** en
+   rangos contiguos (`partitioner.py`). Crea **más particiones que
+   Workers**: 3 por Worker participante (9 para 3 Workers), sin superar
+   el número de filas. Cada Task va al Worker participante con menos
+   Tasks y, en empate, al de menor carga y más CPU/RAM, así que un Worker
+   ejecuta varias Tasks. Asigna cada Task con un `attempt_id`, un lease y
+   la época del líder, y pasa el Job a `running` (implementado).
+
+   Las particiones pequeñas siguen el paso 7 del diseño: permiten que los
+   Workers con más capacidad tomen más trabajo y que, si un Worker falla,
+   sus Tasks se repartan entre los que siguen vivos. La identidad de cada
+   partición (`partition_index` y sus filas) no cambia entre épocas; lo
+   que puede cambiar es qué Worker la ejecuta. `PARTITIONS_PER_WORKER` en
+   `partitioner.py` es el parámetro interno que se ajusta en pruebas.
+5. Para cada ronda, el coordinador envía los pesos actuales a cada Worker
+   (`dispatcher.py`). Cada Worker comprueba que la Task es suya y del
+   intento vigente, calcula el gradiente de su partición y lo devuelve
+   (implementado para una ronda).
+6. El coordinador agrega los gradientes, actualiza los pesos y repite por
+   cada época (pendiente).
+7. El coordinador evalúa con el conjunto de test y guarda el resultado en
+   `results` (pendiente).
+8. Una interfaz consultará el estado del Job y sus métricas (pendiente).
+
+#### Protocolo de una ronda
+
+`POST /internal/tasks/{task_id}/gradient` en el servicio interno de cada
+Worker (puerto `20000 + node_id mod 20000`):
+
+```json
+{
+  "attempt_id": "<attempt_id vigente de la Task>",
+  "leader_epoch": 64,
+  "training_epoch": 1,
+  "parameters": {"weights": [[0.0, 0.0]], "bias": [0.0, 0.0]}
+}
+```
+
+Antes de calcular, el Worker verifica en CockroachDB que la Task esté
+asignada a él con ese `attempt_id`, que la época del líder sea la vigente
+y que el Job esté `running`. Si algo no coincide responde 409, de modo
+que un intento reemplazado o un coordinador anterior no pueden usar sus
+resultados. La respuesta repite `task_id`, `attempt_id`,
+`partition_index` y `training_epoch`, e incluye `row_range` y el
+gradiente con su `sample_count`; el coordinador rechaza la ronda
+completa si alguna respuesta no coincide, para no actualizar el modelo
+con gradientes incompletos.
+
+Los Workers no reciben los datos por la red: cada uno prepara el mismo
+CSV con el `target_column`, `train_ratio` y `seed` del Job, lo que da
+exactamente las mismas filas de train, y toma su rango. Por eso el CSV
+debe ser legible desde cada Worker (en este despliegue, el mismo host).
 
 ## Tecnologías
 
@@ -181,7 +224,9 @@ pero todavía no contiene archivos.
 │   │   ├── scheduler.py
 │   │   ├── preprocessing.py   # Target, codificación, normalización y split
 │   │   ├── local_training.py  # Entrenamiento local de referencia (baseline)
-│   │   ├── partitioner.py
+│   │   ├── partitioner.py     # Reparte las filas de train en Tasks
+│   │   ├── job_data.py        # Prepara el dataset de un Job (con caché)
+│   │   ├── dispatcher.py      # Envía una ronda y recoge los gradientes
 │   │   └── aggregator.py
 │   ├── database/
 │   │   ├── connection.py
@@ -193,10 +238,13 @@ pero todavía no contiene archivos.
 │   │   └── datasets/
 │   ├── tests/
 │   │   ├── test_leadership_repository.py
+│   │   ├── test_partitioner.py
 │   │   ├── test_preprocessing.py
 │   │   └── test_training_engine.py
 │   └── workers/
 │       ├── worker.py
+│       ├── coordination.py      # Liderazgo y servicio HTTP interno
+│       ├── task_executor.py     # Calcula el gradiente de una Task
 │       └── training_engine.py   # Logistic Regression en PyTorch
 ├── docs/
 │   └── distributed-coordination-architecture.md
@@ -211,9 +259,10 @@ CSV, apoyado en `backend/dataset_storage.py` para el manejo de archivos.
 entrenamiento y `backend/api/jobs.py` lo usa al crear un Job.
 `backend/workers/training_engine.py` implementa el modelo y
 `backend/coordinator/local_training.py` el entrenamiento local de
-referencia. Los módulos de `cluster` y `training`,
-`coordinator/partitioner.py` y `coordinator/aggregator.py` son
-marcadores sin funcionalidad. `backend/database/schema.sql` es un placeholder;
+referencia. `coordinator/partitioner.py`, `coordinator/dispatcher.py`
+y `workers/task_executor.py` reparten y ejecutan las Tasks. Los módulos
+de `cluster` y `training` y `coordinator/aggregator.py` son marcadores
+sin funcionalidad. `backend/database/schema.sql` es un placeholder;
 el esquema integral de referencia está en este README. La migración de
 liderazgo sirve para aplicar esa tabla de forma aditiva a una base ya
 existente; no sustituye el DDL de instalación limpia de abajo.
@@ -596,14 +645,14 @@ python -m unittest discover -s tests -p "test_*.py" -v
 - Los CSV se guardan en el disco local del Backend: CockroachDB replica
   sus metadatos, pero no el archivo. Si se pierde el disco del Backend,
   se pierden los CSV aunque la base de datos siga intacta.
-- Los módulos de coordinación y entrenamiento no implementan Scheduler,
-  elección automática, comunicación Worker-a-Worker, ejecución ML,
-  agregación ni recuperación de tareas.
-- El repositorio ofrece primitivas de lease persistente, pero ningún
-  Worker las renueva o utiliza automáticamente. La existencia de la tabla
-  no equivale a failover de coordinación.
-- No hay monitor que marque automáticamente `offline` a un Worker cuyo
-  Heartbeat haya vencido.
+- El ciclo de épocas, la evaluación final y la recuperación de Tasks
+  todavía no están conectados: hoy el coordinador puede ejecutar una
+  ronda, pero ningún proceso la repite hasta completar el Job.
+- El lease de cada Task (30 s) se fija al asignarla y no se renueva; la
+  recuperación de Tasks deberá renovarlo o reasignar las vencidas.
+- Cada Worker vuelve a preparar el dataset del Job en memoria (una vez por
+  Job). Con datasets grandes, los tres procesos ocupan esa memoria a la vez
+  en el mismo host.
 - Los tres contenedores DB y los Workers locales comparten un host. Se
   verificó la replicación (tres réplicas por rango) y la tolerancia a la
   pérdida de un nodo, pero no se garantiza tolerancia a la pérdida del

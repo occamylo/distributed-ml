@@ -1,8 +1,9 @@
 import json
 import logging
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 from uuid import UUID
@@ -22,10 +23,17 @@ from database.repository import (
     validate_leadership,
 )
 
+if TYPE_CHECKING:
+    from workers.task_executor import TaskExecutor
+
 DEFAULT_ELECTION_INTERVAL_SECONDS = 3.0
 INTERNAL_PORT_BASE = 20000
 INTERNAL_PORT_RANGE = 20000
 INTERNAL_LEADERSHIP_PATH = "/internal/leadership"
+INTERNAL_GRADIENT_PATH = re.compile(
+    r"^/internal/tasks/(?P<task_id>[0-9a-fA-F-]{36})/gradient$"
+)
+MAX_REQUEST_BYTES = 64 * 1024 * 1024
 PEER_REQUEST_TIMEOUT_SECONDS = 2.0
 logger = logging.getLogger(__name__)
 
@@ -38,12 +46,22 @@ def _host_for_url(host: str) -> str:
     return f"[{host}]" if ":" in host else host
 
 
+def internal_base_url(node: dict[str, Any]) -> str | None:
+    """Base URL of a Worker's internal HTTP service, from its nodes row."""
+    host = node.get("ip_address") or node.get("hostname")
+    node_id = node.get("node_id")
+    if not isinstance(host, str) or not host or not isinstance(node_id, UUID):
+        return None
+    return f"http://{_host_for_url(host)}:{_port_for_node(node_id)}"
+
+
 class WorkerCoordination:
     def __init__(
         self,
         node_id: UUID,
         advertised_host: str,
         election_interval_seconds: float = DEFAULT_ELECTION_INTERVAL_SECONDS,
+        task_executor: "TaskExecutor | None" = None,
     ) -> None:
         if not advertised_host:
             raise ValueError("An advertised host is required for coordination.")
@@ -51,6 +69,7 @@ class WorkerCoordination:
             raise ValueError("Election interval must be greater than zero.")
 
         self.node_id = node_id
+        self._task_executor = task_executor
         self._port = _port_for_node(node_id)
         self.url = (
             f"http://{_host_for_url(advertised_host)}:{self._port}"
@@ -220,13 +239,57 @@ class WorkerCoordination:
                         {"detail": "Leadership status is temporarily unavailable."},
                     )
 
+            def do_POST(self) -> None:
+                match = INTERNAL_GRADIENT_PATH.match(self.path)
+                if match is None:
+                    self._send_json(404, {"detail": "Internal coordination route not found."})
+                    return
+                executor = service._task_executor
+                if executor is None:
+                    self._send_json(503, {"detail": "This Worker does not execute Tasks."})
+                    return
+
+                # Imported here to keep the leadership service usable alone.
+                from workers.task_executor import GradientRequest, TaskRequestError
+
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < length <= MAX_REQUEST_BYTES:
+                        raise TaskRequestError(413, "Missing or oversized request body.")
+                    payload = json.loads(self.rfile.read(length))
+                    request = GradientRequest.parse(UUID(match["task_id"]), payload)
+                    response = executor.compute_task_gradient(request)
+                except TaskRequestError as exc:
+                    self._send_json(exc.status_code, {"detail": exc.detail})
+                    return
+                except (ValueError, UnicodeDecodeError) as exc:
+                    self._send_json(400, {"detail": f"Invalid request ({exc})."})
+                    return
+                except (PsycopgError, PoolTimeout) as exc:
+                    logger.warning(
+                        "Worker %s could not check a Task request (%s).",
+                        service.node_id,
+                        type(exc).__name__,
+                    )
+                    self._send_json(503, {"detail": "The database is temporarily unavailable."})
+                    return
+                self._send_json(200, response)
+
             def _send_json(self, status_code: int, payload: dict[str, Any]) -> None:
                 body = json.dumps(payload).encode("utf-8")
-                self.send_response(status_code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.send_response(status_code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionError) as exc:
+                    # The caller gave up (timeout or shutdown); nothing to answer.
+                    logger.debug(
+                        "Worker %s could not deliver a response (%s).",
+                        service.node_id,
+                        type(exc).__name__,
+                    )
 
             def log_message(self, format_string: str, *args: Any) -> None:
                 logger.debug(format_string, *args)
