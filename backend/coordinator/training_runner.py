@@ -6,7 +6,9 @@ For each ``running`` Job whose Tasks are all assigned, the coordinator:
 2. For every training epoch, sends the current global weights to all Tasks,
    waits for every gradient, aggregates them with the weighted average
    G = sum(n_i * G_i) / sum(n_i) and updates w <- w - learning_rate * G.
-3. Marks the Tasks and the Job ``completed``.
+3. Evaluates the final weights on the test split, which never took part in
+   training, and in one fenced transaction marks the Tasks and the Job
+   ``completed`` and stores the single ``results`` row.
 
 The epoch context (weights, loss history) lives only in this process, as
 the data contract requires: Tasks are logical partitions, not per-epoch
@@ -15,13 +17,14 @@ the leader and its epoch in the same transaction. If this Worker loses the
 lease mid-training it stops; the next coordinator restarts the Job from
 the initial weights, which is deterministic and gives the same model.
 
-Not yet here: evaluation and ``results`` (Tarea 17) and recovery of failed
-Tasks (Tarea 18). Until then a failed round fails the Job.
+Not yet here: recovery of failed Tasks (Tarea 18). Until then a failed
+round fails the Job.
 """
 
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
@@ -29,11 +32,13 @@ from uuid import UUID
 from psycopg import Error as PsycopgError
 from psycopg_pool import PoolTimeout
 
+from coordinator.aggregator import aggregate_gradients, apply_update
 from coordinator.dispatcher import RoundFailedError, request_gradients
 from coordinator.job_data import PreparedDatasetCache
-from coordinator.preprocessing import DatasetPreparationError
+from coordinator.preprocessing import DatasetPreparationError, PreparedDataset
 from database.repository import (
     DEFAULT_CLUSTER_ID,
+    complete_job_as_leader,
     get_job,
     get_leadership,
     list_jobs,
@@ -46,17 +51,64 @@ from workers.coordination import WorkerCoordination
 from workers.training_engine import (
     DEFAULT_EPOCHS,
     DEFAULT_LEARNING_RATE,
+    Evaluation,
     ModelParameters,
-    aggregate_gradients,
-    apply_update,
+    evaluate,
     initial_parameters,
     validate_hyperparameters,
 )
 
 DEFAULT_RUNNER_INTERVAL_SECONDS = 1.0
 LOG_EVERY_EPOCHS = 10
+MAX_LOSS_HISTORY_POINTS = 200
 logger = logging.getLogger(__name__)
 Record = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TrainingSummary:
+    learning_rate: float
+    loss_history: list[float]
+    partitions: int
+    workers: int
+    duration_seconds: float
+
+
+def build_result_metrics(
+    prepared: PreparedDataset,
+    weights: ModelParameters,
+    train_evaluation: Evaluation,
+    test_evaluation: Evaluation,
+    summary: TrainingSummary,
+) -> dict[str, Any]:
+    """JSON document stored in ``results.metrics``.
+
+    Holds what the result screen and the local vs distributed comparison
+    need: both evaluations, the training configuration actually used, a
+    sampled loss curve and the final weights (small for Logistic
+    Regression, so no separate model file is written).
+    """
+    history = summary.loss_history
+    step = max(1, -(-len(history) // MAX_LOSS_HISTORY_POINTS))
+    sampled = list(range(0, len(history), step))
+    if history and sampled[-1] != len(history) - 1:
+        sampled.append(len(history) - 1)
+    return {
+        "class_labels": prepared.class_labels,
+        "feature_names": prepared.feature_names,
+        "test": test_evaluation.to_dict(prepared.class_labels),
+        "train": train_evaluation.to_dict(prepared.class_labels),
+        "training": {
+            "epochs": len(history),
+            "learning_rate": summary.learning_rate,
+            "partitions": summary.partitions,
+            "workers": summary.workers,
+            "train_rows": len(prepared.y_train),
+            "test_rows": len(prepared.y_test),
+        },
+        "train_loss_by_epoch": [[index + 1, history[index]] for index in sampled],
+        "model": weights.to_dict(),
+    }
 
 
 class LeadershipLost(Exception):
@@ -202,43 +254,57 @@ class TrainingCoordinator:
                     len(results),
                 )
 
-        self._complete_job(job_id, leader_epoch, weights, loss_history, time.perf_counter() - started)
+        self._ensure_leadership(leader_epoch)
+        self._complete_job(
+            job_id,
+            leader_epoch,
+            prepared,
+            weights,
+            TrainingSummary(
+                learning_rate=learning_rate,
+                loss_history=loss_history,
+                partitions=len(tasks),
+                workers=len({task["node_id"] for task in tasks}),
+                duration_seconds=time.perf_counter() - started,
+            ),
+        )
 
     def _complete_job(
         self,
         job_id: UUID,
         leader_epoch: int,
+        prepared: PreparedDataset,
         weights: ModelParameters,
-        loss_history: list[float],
-        duration_seconds: float,
+        summary: "TrainingSummary",
     ) -> None:
-        now = datetime.now(timezone.utc)
-        completed_tasks = update_job_tasks_as_leader(
-            job_id,
-            ["running"],
-            {"status": "completed", "completed_at": now},
-            self._coordination.node_id,
-            leader_epoch,
-            DEFAULT_CLUSTER_ID,
+        # The test split never took part in training (README, step 11).
+        train_evaluation = evaluate(weights, prepared.x_train, prepared.y_train)
+        test_evaluation = evaluate(weights, prepared.x_test, prepared.y_test)
+        metrics = build_result_metrics(
+            prepared, weights, train_evaluation, test_evaluation, summary
         )
-        if completed_tasks is None:
-            raise LeadershipLost()
-        job = update_job_as_leader(
+        result = complete_job_as_leader(
             job_id,
-            "running",
-            {"status": "completed", "completed_at": now},
-            self._coordination.node_id,
-            leader_epoch,
-            DEFAULT_CLUSTER_ID,
+            completed_at=datetime.now(timezone.utc),
+            duration_seconds=summary.duration_seconds,
+            accuracy=test_evaluation.accuracy,
+            loss=test_evaluation.loss,
+            metrics=metrics,
+            leader_node_id=self._coordination.node_id,
+            leader_epoch=leader_epoch,
         )
-        if job is None:
-            raise LeadershipLost()
+        if result is None:
+            # Either the lease moved or the Job left ``running`` meanwhile.
+            self._ensure_leadership(leader_epoch)
+            logger.warning("Job %s was no longer running; its result was not stored.", job_id)
+            return
         logger.info(
-            "Job %s completed: %s epochs in %.3f s, final train loss %.6f.",
+            "Job %s completed: %s epochs in %.3f s; test accuracy %.4f, test loss %.6f.",
             job_id,
-            len(loss_history),
-            duration_seconds,
-            loss_history[-1] if loss_history else float("nan"),
+            len(summary.loss_history),
+            summary.duration_seconds,
+            test_evaluation.accuracy,
+            test_evaluation.loss,
         )
 
     def _fail_job(self, job_id: UUID, leader_epoch: int, reason: str) -> None:

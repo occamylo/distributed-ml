@@ -487,6 +487,23 @@ Obtiene el resultado asociado a un Job.
 - Devuelve `dict` si existe.
 - Devuelve `None` si el Job aún no tiene resultado.
 
+#### `complete_job_as_leader(job_id, completed_at, duration_seconds, accuracy, loss, metrics, leader_node_id, leader_epoch, model_path=None)`
+
+Cierra un Job y guarda su resultado de forma atómica, solo si quien llama sigue siendo el líder vigente con esa época (sección 17.5).
+
+En una misma transacción:
+
+1. Valida el liderazgo.
+2. Pasa el Job de `running` a `completed` con `completed_at`.
+3. Pasa las Tasks `running` del Job a `completed` con el mismo `completed_at`.
+4. Inserta la fila de `results`.
+
+Reglas:
+
+- Devuelve el resultado creado, o `None` si quien llama ya no posee el lease o si el Job no estaba `running`; en ambos casos no modifica nada.
+- Si el Job ya tiene resultado, se propaga el error de unicidad y se revierte toda la transacción.
+- No calcula métricas ni decide cuándo termina un Job: los valores los entrega el coordinador.
+
 #### `update_result(...)`
 
 **No se implementará.**
@@ -646,7 +663,7 @@ Un Job representa una solicitud de procesamiento asociada a un Dataset. Para pla
 - `actual_workers` representa el número de Workers distintos que recibieron al menos una Task del Job; no se calcula a partir de Workers solicitados ni seleccionados sin asignación.
 - El Job pasa a `running` cuando se confirma la primera asignación de Task. `started_at` se establece en esa transición.
 - `completed`, `failed` y `cancelled` son estados existentes en el esquema de referencia. Sus transiciones y la relación con la agregación o cancelación no forman parte de esta tarea.
-- La política cuando hay menos Workers elegibles que `requested_workers` está pendiente. Como propuesta conservadora para revisar, el Job permanece `pending` y no se crean asignaciones parciales hasta que haya suficientes Workers. Esta política requiere aprobación antes de implementarse.
+- **Política aprobada e implementada:** cuando hay menos Workers elegibles que `requested_workers`, el Job permanece `pending` y no se crean Tasks ni asignaciones parciales; el Scheduler lo reintenta en cada ciclo hasta que haya suficientes Workers. Para que un Job no espere indefinidamente, `POST /jobs` rechaza con 422 un `requested_workers` mayor que el número de Workers en línea (README, paso 4: no puede superar los elegibles).
 
 Un Job debe referenciar un Dataset existente. La lectura del archivo y la determinación de sus filas o particiones no corresponden al contrato del Job.
 
@@ -719,7 +736,7 @@ La siguiente implementación deberá definir operaciones de Repository para cons
 - **Correspondencia del esquema:** el DDL de referencia del README incluye `attempt_id`, `lease_until` y `leader_epoch`, pero no se debe asumir que existen en la base física. `schema.sql` no contiene el esquema integral y las funciones actuales del Repository no leen ni escriben esos campos. Antes de usarlos debe confirmarse el esquema desplegado; cualquier migración requiere una decisión separada.
 - **Estado documental de liderazgo:** el código actual inicia elección desde el Worker, mientras que el README todavía describe la elección automática y la comunicación Worker-a-Worker como pendientes. Esta sección distingue la capacidad de liderazgo existente de las capacidades de Scheduler/cola aún no implementadas.
 - **Particionado:** `partitioner.py` no implementa generación de particiones. Falta definir el número de Tasks por Job, cómo se distribuyen las filas y cómo puede el Worker reconstruir el segmento a partir de `partition_index` y `rows_assigned`, sin añadir campos por suposición.
-- **Workers insuficientes:** debe aprobarse si un Job espera a reunir `requested_workers` o puede ejecutarse con menos; la propuesta conservadora está en 17.1.
+- **Workers insuficientes:** resuelto. Se aprobó la propuesta conservadora de 17.1: el Job espera en `pending`.
 - **Disponibilidad y capacidad:** deben definirse el umbral de vigencia, la política para `busy`, los mínimos de CPU/RAM y el máximo de Tasks concurrentes por Worker.
 - **Entrega al ejecutor:** debe definirse el mecanismo de consulta, asignación y reconocimiento de Tasks. Actualmente el Worker solo publica Heartbeat/métricas.
 - **Fencing del Repository:** se necesitan operaciones transaccionales que combinen validación del liderazgo y mutación de la cola; las funciones existentes no ofrecen esa atomicidad.

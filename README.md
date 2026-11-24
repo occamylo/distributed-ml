@@ -26,7 +26,8 @@ distribuido todavía no están implementados.
 | Frontend | No implementado. |
 | Scheduler | Implementado en el Worker líder: elige Workers por capacidad, reparte las filas de train en más Tasks que Workers (3 por Worker) y las asigna de forma equilibrada. |
 | Ciclo de entrenamiento distribuido | Implementado en el Worker líder: una ronda por época, agregación ponderada de gradientes, actualización de pesos y transición de Tasks y Job a `completed`. Da la misma pérdida que el entrenamiento local. |
-| Evaluación, `results` y recuperación de Tasks | Pendientes. Hoy un Worker caído durante el entrenamiento deja el Job en `failed`. |
+| Evaluación y resultados | Implementados: el coordinador evalúa con el conjunto de test y, en una sola transacción, completa Tasks y Job y guarda el resultado; `GET /jobs/{job_id}/result` lo devuelve. |
+| Recuperación de Tasks | Pendiente. Hoy un Worker caído durante el entrenamiento deja el Job en `failed`. |
 
 El diseño técnico de elección de coordinador, fencing, comunicación
 entre Workers y recuperación está descrito en
@@ -135,7 +136,9 @@ implementado.
 3. Los Workers eligen un coordinador con el lease de `cluster_leadership`
    (implementado).
 4. El Scheduler del coordinador elige Workers por sus métricas en
-   `nodes`, prepara el dataset y reparte **solo las filas de train** en
+   `nodes`. Si no hay tantos Workers elegibles como `requested_workers`,
+   el Job espera en `pending` sin asignaciones parciales. Cuando los hay,
+   prepara el dataset y reparte **solo las filas de train** en
    rangos contiguos (`partitioner.py`). Crea **más particiones que
    Workers**: 3 por Worker participante (9 para 3 Workers), sin superar
    el número de filas. Cada Task va al Worker participante con menos
@@ -161,8 +164,11 @@ implementado.
    gradientes, los agrega con `Σ nᵢ·Gᵢ / Σ nᵢ` y actualiza
    `w ← w − learning_rate · G`. Al terminar pasa Tasks y Job a
    `completed` con `completed_at` (implementado).
-7. El coordinador evalúa con el conjunto de test y guarda el resultado en
-   `results` antes de completar el Job (pendiente).
+7. Con los pesos finales, el coordinador evalúa el conjunto de test, que
+   nunca participó en el entrenamiento. En **una sola transacción** con
+   verificación de líder pasa Tasks y Job a `completed` y guarda la fila
+   única de `results`: o se guardan los tres cambios o ninguno
+   (implementado).
 8. Una interfaz consultará el estado del Job y sus métricas (pendiente).
 
 #### Protocolo de una ronda
@@ -234,14 +240,12 @@ pero todavía no contiene archivos.
 │   │   ├── partitioner.py     # Reparte las filas de train en Tasks
 │   │   ├── job_data.py        # Prepara el dataset de un Job (con caché)
 │   │   ├── dispatcher.py      # Envía una ronda y recoge los gradientes
-│   │   ├── training_runner.py # Ciclo de épocas en el Worker líder
-│   │   └── aggregator.py
+│   │   ├── training_runner.py # Ciclo de épocas, evaluación y resultado
+│   │   └── aggregator.py      # Promedio ponderado y actualización de pesos
 │   ├── database/
 │   │   ├── connection.py
 │   │   ├── repository.py
-│   │   ├── schema.sql
-│   │   └── migrations/
-│   │       └── 001_create_cluster_leadership.sql
+│   │   └── schema.sql         # Esquema completo: 6 tablas y fila de liderazgo
 │   ├── storage/
 │   │   └── datasets/
 │   ├── tests/
@@ -253,7 +257,7 @@ pero todavía no contiene archivos.
 │       ├── worker.py
 │       ├── coordination.py      # Liderazgo y servicio HTTP interno
 │       ├── task_executor.py     # Calcula el gradiente de una Task
-│       └── training_engine.py   # Logistic Regression en PyTorch
+│       └── training_engine.py   # Modelo y gradiente de una partición (PyTorch)
 ├── docs/
 │   └── distributed-coordination-architecture.md
 ├── frontend/                 # Directorio vacío; UI no implementada
@@ -265,17 +269,18 @@ Heartbeat. `backend/api/datasets.py` implementa la carga y gestión de
 CSV, apoyado en `backend/dataset_storage.py` para el manejo de archivos.
 `backend/coordinator/preprocessing.py` prepara los datos para el
 entrenamiento y `backend/api/jobs.py` lo usa al crear un Job.
-`backend/workers/training_engine.py` implementa el modelo y
-`backend/coordinator/local_training.py` el entrenamiento local de
+`backend/workers/training_engine.py` implementa el modelo y lo que
+calcula un Worker (gradiente de una partición y evaluación);
+`backend/coordinator/aggregator.py`, lo que hace el coordinador con esos
+gradientes (promedio ponderado y actualización de pesos), y
+`backend/coordinator/local_training.py`, el entrenamiento local de
 referencia. `coordinator/partitioner.py`, `coordinator/dispatcher.py`
 y `workers/task_executor.py` reparten y ejecutan las Tasks;
-`coordinator/training_runner.py` repite las rondas por época y agrega
-los gradientes. Los módulos
-de `cluster` y `training` y `coordinator/aggregator.py` son marcadores
-sin funcionalidad. `backend/database/schema.sql` es un placeholder;
-el esquema integral de referencia está en este README. La migración de
-liderazgo sirve para aplicar esa tabla de forma aditiva a una base ya
-existente; no sustituye el DDL de instalación limpia de abajo.
+`coordinator/training_runner.py` repite las rondas por época, evalúa y
+guarda el resultado. `api/cluster.py` y `api/training.py` quedan como
+marcadores para las vistas del frontend. `backend/database/schema.sql`
+contiene el esquema completo que se aplica en una instalación nueva,
+incluida la tabla `cluster_leadership` y su fila `default`.
 
 ## Modelo de datos
 
@@ -527,9 +532,10 @@ Endpoints disponibles:
 | `GET /datasets/{dataset_id}` | Devuelve los metadatos de un dataset. |
 | `GET /datasets/{dataset_id}/columns` | Lee el encabezado del archivo, para elegir la columna objetivo. Responde 409 si el archivo no está en este host. |
 | `DELETE /datasets/{dataset_id}` | Borra el registro y el archivo. Responde 409 si algún Job usa el dataset. |
-| `POST /jobs` | Crea un Job `pending`. Antes de crearlo prepara el dataset completo (ver abajo) y responde 422 si no sirve para entrenar. Devuelve el Job y un resumen `preparation` con columnas, clases y filas de train/test. |
+| `POST /jobs` | Crea un Job `pending`. Responde 422 si `requested_workers` supera los Workers en línea. Antes de crearlo prepara el dataset completo (ver abajo) y responde 422 si no sirve para entrenar. Devuelve el Job y un resumen `preparation` con columnas, clases y filas de train/test. |
 | `GET /jobs/{job_id}` | Devuelve un Job. |
 | `GET /jobs/{job_id}/tasks` | Devuelve las Tasks que el Scheduler creó para el Job. |
+| `GET /jobs/{job_id}/result` | Devuelve el resultado del Job: `accuracy` y `loss` del conjunto de test, `duration_seconds` y `metrics`. Responde 404 mientras el Job no tenga resultado. |
 
 Reglas de validación de los CSV:
 
@@ -574,16 +580,29 @@ reducen la pérdida con gradiente descendente sobre todo el conjunto; con
 
 ### Modelo y entrenamiento local de referencia
 
-`backend/workers/training_engine.py` implementa Logistic Regression con
-softmax, que cubre binario y multiclase con una sola fórmula. Separa las
-operaciones del entrenamiento distribuido:
+El modelo es Logistic Regression con softmax, que cubre binario y
+multiclase con una sola fórmula. Sus operaciones están separadas según
+quién las ejecuta:
 
-| Función | Quién la usará | Qué hace |
-|---|---|---|
-| `compute_gradient` | Cada Worker | Gradiente medio de su partición con los pesos actuales, más el número de filas. |
-| `aggregate_gradients` | Coordinador | Promedio ponderado `Σ nᵢ·Gᵢ / Σ nᵢ`. |
-| `apply_update` | Coordinador | `w ← w − learning_rate · G`. |
-| `evaluate` | Coordinador | Loss, accuracy y matriz de confusión sobre el conjunto de prueba. |
+| Función | Módulo | Quién la usa | Qué hace |
+|---|---|---|---|
+| `compute_gradient` | `workers/training_engine.py` | Cada Worker | Gradiente medio de su partición con los pesos actuales, más el número de filas. |
+| `aggregate_gradients` | `coordinator/aggregator.py` | Coordinador | Promedio ponderado `Σ nᵢ·Gᵢ / Σ nᵢ`. |
+| `apply_update` | `coordinator/aggregator.py` | Coordinador | `w ← w − learning_rate · G`. |
+| `evaluate` | `workers/training_engine.py` | Coordinador | Loss, accuracy y matriz de confusión. |
+
+Contenido de `results.metrics` al terminar un Job:
+
+| Clave | Contenido |
+|---|---|
+| `test`, `train` | `loss`, `accuracy`, `sample_count`, `confusion_matrix` (filas = clase real, columnas = predicha) y `class_labels` |
+| `training` | `epochs`, `learning_rate`, `partitions`, `workers`, `train_rows`, `test_rows` usados de verdad |
+| `train_loss_by_epoch` | Pares `[época, loss]`, hasta 200 puntos |
+| `class_labels`, `feature_names` | Orden de las clases y de las columnas codificadas |
+| `model` | Pesos y bias finales; son pequeños, así que no se escribe un archivo aparte y `model_path` queda vacío |
+
+`duration_seconds` mide desde que el coordinador empieza el Job hasta que
+termina la última época.
 
 Los pesos empiezan en cero y los gradientes son de todo el lote, así que
 el entrenamiento es determinista. Como el promedio ponderado de los
@@ -655,9 +674,13 @@ python -m unittest discover -s tests -p "test_*.py" -v
 - Los CSV se guardan en el disco local del Backend: CockroachDB replica
   sus metadatos, pero no el archivo. Si se pierde el disco del Backend,
   se pierden los CSV aunque la base de datos siga intacta.
-- La evaluación con el conjunto de test y la tabla `results` todavía no
-  están conectadas: un Job `completed` entrenó, pero aún no guarda
-  métricas.
+- Si hay menos Workers elegibles que `requested_workers`, el Job espera
+  en `pending`, sin Tasks ni asignaciones parciales, y el Scheduler lo
+  reintenta cada segundo (`contrato.md` §17.1). Todos los Workers miden la
+  CPU del equipo completo: si el equipo está ocupado publican `0.0`
+  núcleos disponibles y quedan fuera durante ese ciclo, lo que solo
+  retrasa el arranque. Los umbrales de CPU/RAM siguen pendientes de
+  decisión (`contrato.md` §17.6).
 - Si un Worker cae durante el entrenamiento, la ronda falla y el Job pasa
   a `failed` con el motivo en `error_message`; el modelo nunca se
   actualiza con gradientes incompletos. Reasignar las Tasks del Worker

@@ -1,15 +1,16 @@
+"""Model (Worker side), aggregation (Coordinator side) and the local baseline."""
+
 import random
 import unittest
 
+from coordinator.aggregator import aggregate_gradients, apply_update
+from coordinator.local_training import train_local
 from workers.training_engine import (
     Gradient,
     ModelParameters,
-    aggregate_gradients,
-    apply_update,
     compute_gradient,
     evaluate,
     initial_parameters,
-    train_local,
     validate_hyperparameters,
 )
 

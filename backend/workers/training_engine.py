@@ -1,17 +1,15 @@
 """Logistic Regression with softmax, written for data parallelism.
 
-The same three operations serve the local baseline and the distributed run:
+This module holds the model and what a Worker computes:
 
-* ``compute_gradient``: what a Worker does with its partition and the
-  current global weights. It returns the *mean* gradient of the partition
-  and the number of rows, so the Coordinator can weight it.
-* ``aggregate_gradients``: the Coordinator's weighted average
-  G = sum(n_i * G_i) / sum(n_i).
-* ``apply_update``: the Coordinator's step w <- w - learning_rate * G.
+* ``compute_gradient``: the *mean* gradient of one partition with the
+  current global weights, plus its number of rows, so the Coordinator can
+  weight it.
+* ``evaluate``: loss, accuracy and confusion matrix of some rows.
 
-Because the weighted average of per-partition mean gradients equals the
-full-batch gradient, a distributed epoch and a local epoch produce the same
-weights (up to floating point rounding).
+The Coordinator's side (weighted aggregation and the weight update) lives in
+``coordinator/aggregator.py``, and the single-process baseline in
+``coordinator/local_training.py``.
 
 Softmax covers both binary and multiclass targets with one formula.
 Parameters travel as plain lists so they can be sent over HTTP or stored
@@ -19,9 +17,8 @@ as JSON.
 """
 
 import math
-import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -105,17 +102,6 @@ class Evaluation:
         return data
 
 
-@dataclass
-class TrainingResult:
-    parameters: ModelParameters
-    train_evaluation: Evaluation
-    test_evaluation: Evaluation
-    duration_seconds: float
-    epochs: int
-    learning_rate: float
-    loss_history: list[float] = field(default_factory=list)
-
-
 def initial_parameters(feature_count: int, class_count: int) -> ModelParameters:
     """Zero weights: deterministic, so every run starts from the same point."""
     if feature_count < 1 or class_count < 2:
@@ -147,34 +133,6 @@ def compute_gradient(
     )
 
 
-def aggregate_gradients(gradients: Sequence[Gradient]) -> Gradient:
-    """Weighted average by sample count: sum(n_i * G_i) / sum(n_i)."""
-    if not gradients:
-        raise ValueError("At least one gradient is required.")
-    total = sum(gradient.sample_count for gradient in gradients)
-    if total <= 0:
-        raise ValueError("Gradients must come from at least one row.")
-
-    weights = sum(
-        torch.tensor(g.weights, dtype=DTYPE) * g.sample_count for g in gradients
-    ) / total
-    bias = sum(torch.tensor(g.bias, dtype=DTYPE) * g.sample_count for g in gradients) / total
-    loss = sum(g.loss * g.sample_count for g in gradients) / total
-    return Gradient(weights.tolist(), bias.tolist(), total, loss)
-
-
-def apply_update(
-    parameters: ModelParameters,
-    gradient: Gradient,
-    learning_rate: float,
-) -> ModelParameters:
-    """One gradient-descent step: w <- w - learning_rate * G."""
-    weights, bias = _tensors(parameters)
-    new_weights = weights - learning_rate * torch.tensor(gradient.weights, dtype=DTYPE)
-    new_bias = bias - learning_rate * torch.tensor(gradient.bias, dtype=DTYPE)
-    return ModelParameters(new_weights.tolist(), new_bias.tolist())
-
-
 def evaluate(
     parameters: ModelParameters,
     x: Sequence[Sequence[float]],
@@ -196,37 +154,6 @@ def evaluate(
         confusion[actual][predicted] += 1
     correct = sum(confusion[index][index] for index in range(classes))
     return Evaluation(loss, correct / len(y), len(y), confusion)
-
-
-def train_local(
-    x_train: Sequence[Sequence[float]],
-    y_train: Sequence[int],
-    x_test: Sequence[Sequence[float]],
-    y_test: Sequence[int],
-    class_count: int,
-    learning_rate: float = DEFAULT_LEARNING_RATE,
-    epochs: int = DEFAULT_EPOCHS,
-) -> TrainingResult:
-    """Full-batch baseline on one process, with the distributed operations."""
-    validate_hyperparameters(learning_rate, epochs)
-    started = time.perf_counter()
-
-    parameters = initial_parameters(len(x_train[0]), class_count)
-    history: list[float] = []
-    for _ in range(epochs):
-        gradient = aggregate_gradients([compute_gradient(parameters, x_train, y_train)])
-        history.append(gradient.loss)
-        parameters = apply_update(parameters, gradient, learning_rate)
-
-    return TrainingResult(
-        parameters=parameters,
-        train_evaluation=evaluate(parameters, x_train, y_train),
-        test_evaluation=evaluate(parameters, x_test, y_test),
-        duration_seconds=time.perf_counter() - started,
-        epochs=epochs,
-        learning_rate=learning_rate,
-        loss_history=history,
-    )
 
 
 def validate_hyperparameters(learning_rate: float, epochs: int) -> None:

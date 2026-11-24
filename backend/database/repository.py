@@ -796,3 +796,58 @@ def get_result_by_job(job_id: UUID) -> Record | None:
         "SELECT * FROM results WHERE job_id = %s",
         (job_id,),
     )
+
+
+def complete_job_as_leader(
+    job_id: UUID,
+    completed_at: datetime,
+    duration_seconds: float,
+    accuracy: float | None,
+    loss: float | None,
+    metrics: Any,
+    leader_node_id: UUID,
+    leader_epoch: int,
+    model_path: str | None = None,
+    cluster_id: str = DEFAULT_CLUSTER_ID,
+) -> Record | None:
+    """Closes a running Job and stores its result in one transaction.
+
+    In the same transaction as the leadership check, it moves the Job's
+    ``running`` Tasks and the Job itself to ``completed`` and inserts the
+    single ``results`` row. Either all three changes persist or none does.
+    Returns the created result, or ``None`` when the caller no longer holds
+    the lease or the Job is not ``running``. A second result for the same
+    Job propagates the unique-constraint error.
+    """
+
+    def complete(cursor: Any) -> Record | None:
+        if not _lock_current_leadership(cursor, leader_node_id, leader_epoch, cluster_id):
+            return None
+        cursor.execute(
+            "UPDATE jobs SET status = 'completed', completed_at = %s "
+            "WHERE job_id = %s AND status = 'running' RETURNING job_id",
+            (completed_at, job_id),
+        )
+        if cursor.fetchone() is None:
+            return None
+        cursor.execute(
+            "UPDATE tasks SET status = 'completed', completed_at = %s "
+            "WHERE job_id = %s AND status = 'running'",
+            (completed_at, job_id),
+        )
+        cursor.execute(
+            "INSERT INTO results "
+            "(job_id, accuracy, loss, duration_seconds, metrics, model_path) "
+            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
+            (
+                job_id,
+                accuracy,
+                loss,
+                duration_seconds,
+                Jsonb({} if metrics is None else metrics),
+                model_path,
+            ),
+        )
+        return cursor.fetchone()
+
+    return _run_leadership_transaction(complete)

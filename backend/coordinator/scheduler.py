@@ -43,6 +43,7 @@ class Scheduler:
         self._coordination = coordination
         self._interval_seconds = interval_seconds
         self._prepared_datasets = PreparedDatasetCache()
+        self._waiting_jobs: set[UUID] = set()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -110,9 +111,20 @@ class Scheduler:
         candidates = self._eligible_workers(requested_workers + 1)
         candidates.sort(key=lambda node: node["node_id"] == self._coordination.node_id)
         workers = candidates[:requested_workers]
-        if not workers:
-            logger.debug("No eligible Workers are currently available for Job %s.", job_id)
+        # Approved policy (contrato.md §17.1): without enough eligible
+        # Workers the Job stays ``pending`` and gets no partial assignment;
+        # it is retried on the next cycle.
+        if len(workers) < requested_workers:
+            if job_id not in self._waiting_jobs:
+                self._waiting_jobs.add(job_id)
+                logger.info(
+                    "Job %s waits in pending: %s of %s requested Worker(s) are eligible.",
+                    job_id,
+                    len(workers),
+                    requested_workers,
+                )
             return True
+        self._waiting_jobs.discard(job_id)
 
         dataset = get_dataset(dataset_id)
         if dataset is None:

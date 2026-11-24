@@ -14,10 +14,13 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from coordinator.aggregator import aggregate_gradients, apply_update
 from coordinator.preprocessing import (
     DEFAULT_SEED,
     DEFAULT_TRAIN_RATIO,
@@ -27,9 +30,55 @@ from coordinator.preprocessing import (
 from workers.training_engine import (
     DEFAULT_EPOCHS,
     DEFAULT_LEARNING_RATE,
-    TrainingResult,
-    train_local,
+    Evaluation,
+    ModelParameters,
+    compute_gradient,
+    evaluate,
+    initial_parameters,
+    validate_hyperparameters,
 )
+
+
+@dataclass
+class TrainingResult:
+    parameters: ModelParameters
+    train_evaluation: Evaluation
+    test_evaluation: Evaluation
+    duration_seconds: float
+    epochs: int
+    learning_rate: float
+    loss_history: list[float] = field(default_factory=list)
+
+
+def train_local(
+    x_train: Sequence[Sequence[float]],
+    y_train: Sequence[int],
+    x_test: Sequence[Sequence[float]],
+    y_test: Sequence[int],
+    class_count: int,
+    learning_rate: float = DEFAULT_LEARNING_RATE,
+    epochs: int = DEFAULT_EPOCHS,
+) -> TrainingResult:
+    """Full-batch baseline on one process, with the distributed operations."""
+    validate_hyperparameters(learning_rate, epochs)
+    started = time.perf_counter()
+
+    parameters = initial_parameters(len(x_train[0]), class_count)
+    history: list[float] = []
+    for _ in range(epochs):
+        gradient = aggregate_gradients([compute_gradient(parameters, x_train, y_train)])
+        history.append(gradient.loss)
+        parameters = apply_update(parameters, gradient, learning_rate)
+
+    return TrainingResult(
+        parameters=parameters,
+        train_evaluation=evaluate(parameters, x_train, y_train),
+        test_evaluation=evaluate(parameters, x_test, y_test),
+        duration_seconds=time.perf_counter() - started,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        loss_history=history,
+    )
 
 
 def run_local_baseline(

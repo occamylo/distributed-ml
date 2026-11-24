@@ -77,6 +77,20 @@ def create_job(job: JobCreate) -> dict[str, Any]:
             detail="Dataset not found.",
         )
 
+    # The requested Workers cannot exceed the available ones (README, step 4);
+    # otherwise the Job would wait in pending forever (contrato.md §17.1).
+    online_workers = sum(
+        1 for node in repository.list_nodes_with_fresh_metrics() if node.get("status") == "online"
+    )
+    if job.requested_workers > online_workers:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"requested_workers is {job.requested_workers}, but only "
+                f"{online_workers} Worker(s) are online."
+            ),
+        )
+
     # Running the full preparation here rejects unusable datasets before a
     # Job exists, instead of letting the Coordinator fail it later.
     try:
@@ -132,3 +146,19 @@ def read_job_tasks(job_id: UUID) -> list[dict[str, Any]]:
             detail="Job not found.",
         )
     return repository.list_tasks_by_job(job_id)
+
+
+@router.get("/jobs/{job_id}/result")
+def read_job_result(job_id: UUID) -> dict[str, Any]:
+    if repository.get_job(job_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found.",
+        )
+    result = repository.get_result_by_job(job_id)
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="The Job has no result yet.",
+        )
+    return result

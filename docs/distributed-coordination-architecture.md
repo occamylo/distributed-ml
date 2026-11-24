@@ -50,8 +50,10 @@ candidatos por capacidad.
   pueda medir de forma fiable queda en `NULL`. Los Heartbeats no provocan
   detección de expiración ni cambian automáticamente el estado a
   `offline`.
-- `backend/database/migrations/001_create_cluster_leadership.sql`
-  crea aditivamente la tabla de lease y la fila inicial `default`.
+- `backend/database/schema.sql` crea la tabla de lease
+  `cluster_leadership` y su fila inicial `default` junto con el resto del
+  esquema. La migración aditiva que existía antes se integró ahí en la
+  Tarea 9.
 - `repository.py` dispone de operaciones para las cinco tablas de
   aplicación y para inicializar/consultar, adquirir, renovar, liberar y
   validar el lease. Las operaciones que cambian estado reintentan
@@ -193,10 +195,9 @@ ordena candidatos, pero no otorga autoridad.
 
 ### 5.1 Lease persistente
 
-**Implementado:** la migración
-`backend/database/migrations/001_create_cluster_leadership.sql` crea la
-tabla `cluster_leadership`, con `leader_node_id` nullable y FK a
-`nodes(node_id)`, epoch no negativo, lease y timestamp. La migración
+**Implementado:** `backend/database/schema.sql` crea la tabla
+`cluster_leadership`, con `leader_node_id` nullable y FK a
+`nodes(node_id)`, epoch no negativo, lease y timestamp, e
 inserta el registro `default` con propietario nulo, epoch 0 y lease
 expirado mediante `ON CONFLICT DO NOTHING`, por lo que volver a
 aplicarla no sobrescribe un liderazgo vigente.
@@ -452,18 +453,13 @@ Orden sugerido de implementación:
 7. Probar caídas de procesos, pérdida de un nodo DB, particiones de red
    y persistencia real; luego repetir en hosts físicos independientes.
 
-## 11. Migración y pruebas de liderazgo
+## 11. Esquema y pruebas de liderazgo
 
-La migración aditiva se encuentra en
-[`backend/database/migrations/001_create_cluster_leadership.sql`](../backend/database/migrations/001_create_cluster_leadership.sql).
-En PowerShell, desde la raíz del repositorio y con Compose iniciado:
-
-```powershell
-Get-Content -Raw .\backend\database\migrations\001_create_cluster_leadership.sql | docker exec -i distributed-ml-db1 cockroach sql --insecure --database=distributed_ml
-```
-
-El script crea la tabla si no existe e inserta la fila `default` solo si
-falta; no elimina datos ni restablece epoch/propietario existentes.
+La tabla de liderazgo forma parte de
+[`backend/database/schema.sql`](../backend/database/schema.sql), que se
+aplica en una instalación nueva como indica `config.md`. El `INSERT` de la
+fila `default` usa `ON CONFLICT DO NOTHING`, así que no restablece epoch
+ni propietario si la fila ya existe.
 `DATABASE_URL` permite cambiar el destino de las pruebas; sin ella, el
 pool usa el host local configurado en `connection.py`.
 
