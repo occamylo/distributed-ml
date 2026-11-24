@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -15,6 +16,32 @@ class NodeRegistration(BaseModel):
     ip_address: str | None = None
     cpu_cores: int | None = None
     ram_mb: int | None = None
+
+
+@router.get("/nodes")
+def list_workers() -> list[dict[str, Any]]:
+    """Workers with their latest metrics, freshness and leadership role."""
+    fresh_ids = {node["node_id"] for node in repository.list_nodes_with_fresh_metrics()}
+    leadership = repository.get_leadership()
+    leader_id = (
+        leadership["leader_node_id"]
+        if leadership is not None and leadership.get("is_valid")
+        else None
+    )
+    now = datetime.now(timezone.utc)
+    return [
+        {
+            **node,
+            "is_fresh": node["node_id"] in fresh_ids,
+            "is_leader": node["node_id"] == leader_id,
+            "heartbeat_age_seconds": (
+                round((now - node["last_heartbeat"]).total_seconds(), 1)
+                if node.get("last_heartbeat") is not None
+                else None
+            ),
+        }
+        for node in repository.list_nodes()
+    ]
 
 
 @router.post("/nodes", status_code=status.HTTP_201_CREATED)

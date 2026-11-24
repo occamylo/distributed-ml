@@ -94,8 +94,8 @@ flowchart LR
 - **Coordinador:** en el diseño objetivo, un Worker con el lease vigente
   coordinará Jobs y Tasks. La elección, el Scheduler y la comunicación
   Worker-a-Worker aún no están implementados.
-- **Frontend:** el directorio `frontend/` está vacío; no hay interfaz
-  ejecutable actualmente.
+- **Frontend:** todavía no hay interfaz conectada a la API. Hay un
+  prototipo visual en `frontend/prototipo/` como referencia de diseño.
 
 ## Flujo de funcionamiento
 
@@ -304,7 +304,9 @@ pero todavía no contiene archivos.
 │       └── training_engine.py   # Modelo y gradiente de una partición (PyTorch)
 ├── docs/
 │   └── distributed-coordination-architecture.md
-├── frontend/                 # Directorio vacío; UI no implementada
+├── frontend/
+│   └── prototipo/
+│       └── distributed-ml-prototipo.html  # Prototipo visual, sin conexión a la API
 └── docker-compose.yml
 ```
 
@@ -560,8 +562,21 @@ segundos.
 
 ### Frontend
 
-No hay archivos de aplicación en `frontend/`, por lo que actualmente no
-existe un comando para iniciar una interfaz.
+Todavía no hay una interfaz conectada a la API. Como referencia de diseño
+existe `frontend/prototipo/distributed-ml-prototipo.html`, una sola
+página que se abre con doble clic, sin servidor. Tiene cuatro vistas
+(Panel, Clúster, Entrenar y Resultados) y usa datos de las pruebas, no de
+la API.
+
+Estilo del prototipo, que servirá de base para el frontend real:
+
+| Elemento | Valor |
+|---|---|
+| Fondo | Midnight Black `#050505` |
+| Acento | Electric Cobalt `#173FAD` en botones y destellos |
+| Superficies | Vidrio esmerilado (`backdrop-filter: blur`) sobre destellos azul y rojo |
+| Tipografía | Instrument Serif para títulos (una parte en cursiva) e Inter para el texto |
+| Formas | Bordes de 28 px, botones tipo píldora y control segmentado al estilo iOS |
 
 ## Verificación y consulta
 

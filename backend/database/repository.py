@@ -827,6 +827,26 @@ def get_result(result_id: UUID) -> Record | None:
     return _get_one("results", "result_id", result_id)
 
 
+def list_database_ranges() -> list[Record]:
+    """Ranges of the application database with their replicas and leaseholder.
+
+    Ordered by table and range. Uses ``SHOW RANGES``, which CockroachDB serves
+    without access to its restricted internal tables.
+    """
+    with get_pool().connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute("SELECT current_database() AS name")
+            database = cursor.fetchone()["name"]
+            cursor.execute(
+                sql.SQL(
+                    "SELECT table_name, range_id, replicas, lease_holder "
+                    "FROM [SHOW RANGES FROM DATABASE {} WITH TABLES, DETAILS] "
+                    "ORDER BY table_name ASC, range_id ASC"
+                ).format(sql.Identifier(database))
+            )
+            return list(cursor.fetchall())
+
+
 def get_result_by_job(job_id: UUID) -> Record | None:
     return _fetch_one(
         "SELECT * FROM results WHERE job_id = %s",

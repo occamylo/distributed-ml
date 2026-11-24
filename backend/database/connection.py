@@ -1,6 +1,11 @@
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
+import psycopg
 from psycopg import Error as PsycopgError
+from psycopg.conninfo import conninfo_to_dict
 from psycopg_pool import ConnectionPool, PoolTimeout
 
 # libpq tries the hosts in order, so losing the first CockroachDB node does
@@ -66,6 +71,52 @@ def close_pool() -> None:
     _pool = None
     if pool is not None:
         pool.close()
+
+
+def database_hosts() -> list[tuple[str, int]]:
+    """The (host, port) pairs listed in DATABASE_URL, in order."""
+    params = conninfo_to_dict(os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL))
+    hosts = str(params.get("host") or "127.0.0.1").split(",")
+    ports = str(params.get("port") or "26257").split(",")
+    if len(ports) == 1:
+        ports = ports * len(hosts)
+    return [(host, int(port)) for host, port in zip(hosts, ports)]
+
+
+def probe_database_hosts(timeout_seconds: float = 2.0) -> list[dict[str, Any]]:
+    """Opens one short connection to each CockroachDB node, outside the pool.
+
+    Reports whether each node accepts SQL connections and how long it took.
+    It does not prove quorum: a node can answer while its ranges are
+    unavailable; the health check covers that.
+    """
+    params = conninfo_to_dict(os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL))
+
+    def probe(index: int, host: str, port: int) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            with psycopg.connect(
+                **{**params, "host": host, "port": port},
+                connect_timeout=max(1, int(timeout_seconds)),
+            ) as connection:
+                connection.execute("SELECT 1")
+            reachable, error = True, None
+        except PsycopgError as exc:
+            reachable, error = False, type(exc).__name__
+        return {
+            "name": f"db{index + 1}",
+            "host": host,
+            "port": port,
+            "reachable": reachable,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+            "error": error,
+        }
+
+    hosts = database_hosts()
+    with ThreadPoolExecutor(max_workers=len(hosts)) as pool:
+        return list(
+            pool.map(lambda item: probe(item[0], *item[1]), enumerate(hosts))
+        )
 
 
 def check_database_connection() -> bool:

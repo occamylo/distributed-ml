@@ -127,6 +127,12 @@ def create_job(job: JobCreate) -> dict[str, Any]:
     return {**created, "preparation": prepared.summary()}
 
 
+@router.get("/jobs", response_model=list[JobResponse])
+def list_jobs() -> list[dict[str, Any]]:
+    """Every Job, newest first."""
+    return list(reversed(repository.list_jobs()))
+
+
 @router.get("/jobs/{job_id}", response_model=JobResponse)
 def read_job(job_id: UUID) -> dict[str, Any]:
     job = repository.get_job(job_id)
