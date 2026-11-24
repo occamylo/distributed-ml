@@ -1,17 +1,17 @@
-# Distributed ML — Configuración de primer uso
+# Distributed ML — Configuración y ejecución local
 
-Esta guía permite preparar el proyecto en un equipo nuevo o después de moverlo a la carpeta correcta del repositorio. Está pensada para el entorno de desarrollo local en Windows, usando Git Bash, Docker Desktop y Python.
+Guía para preparar el proyecto en un equipo nuevo y ejecutar el sistema completo en un entorno local Windows, utilizando Git Bash, Docker Desktop y Python.
 
-## 1. Tecnologías requeridas
+## 1. Requisitos
 
-Instalar y verificar:
+Instalar:
 
-- Git (Git Bash).
-- Python 3.14.x (el entorno de desarrollo actual usa Python 3.14.7).
-- Docker Desktop, con el motor Linux/WSL2 iniciado.
-- VS Code (opcional, recomendado).
+- Git y Git Bash.
+- Python 3.14.x.
+- Docker Desktop con el motor Linux/WSL2 iniciado.
+- VS Code (opcional).
 
-Comandos de verificación desde Git Bash:
+Verificar las instalaciones desde Git Bash:
 
 ```bash
 git --version
@@ -20,206 +20,309 @@ docker --version
 docker compose version
 ```
 
-## 2. Ubicar el proyecto
+## 2. Obtener el proyecto
 
-Clonar el repositorio en la ubicación deseada y entrar a su carpeta raíz:
-
+Desde Git Bash:
 
 ```bash
 git clone <URL_DEL_REPOSITORIO>
-cd <CARPETA_DEL_REPOSITORIO>
+cd distributed-ml
 ```
 
-La raíz del proyecto debe contener `backend/`, `frontend/`, `docs/` y `docker-compose.yml` (entre otros archivos).
+La raíz del proyecto contiene `backend/`, `frontend/` y `docker-compose.yml`.
 
-## 3. Crear el entorno virtual Python
+## 3. Preparar Python
 
-**No reutilizar ni copiar `.venv` de otro directorio o equipo.** Los entornos virtuales pueden guardar rutas absolutas asociadas a su ubicación original.
-
-Desde la raíz del proyecto, en Git Bash:
+Desde la raíz del proyecto:
 
 ```bash
 python -m venv .venv
 source .venv/Scripts/activate
+python -m pip install --upgrade pip
+python -m pip install -r backend/requirements.txt
 ```
 
-Verificar que Python corresponde al entorno virtual:
+Verificar el entorno:
 
 ```bash
 which python
 python --version
 ```
 
-La ruta de `python` debería apuntar dentro de la carpeta del proyecto, a `.venv/Scripts/`.
+La ruta debe apuntar a `.venv/Scripts/`.
 
-## 4. Instalar dependencias del backend
+No copiar ni reutilizar el entorno `.venv` de otro equipo.
 
-Con el entorno virtual activado y desde la raíz:
+## 4. Levantar CockroachDB
 
-```bash
-python -m pip install --upgrade pip
-python -m pip install -r backend/requirements.txt
-```
+Asegurarse de que Docker Desktop esté iniciado.
 
-Si se abre una nueva terminal, volver a activar el entorno:
-
-```bash
-source .venv/Scripts/activate
-```
-
-## 5. Configurar y levantar CockroachDB
-
-Docker Desktop debe estar iniciado. Desde la raíz del proyecto:
-
+Desde la raíz:
 
 ```bash
 docker compose up -d
-```
-
-Comprobar el estado de los contenedores:
-
-```bash
 docker compose ps
 ```
 
-El Compose local configura tres nodos CockroachDB (`cockroach1`, `cockroach2`, `cockroach3`). Los puertos SQL publicados en el host son `26257`, `26258` y `26259`; las consolas de administración se publican en `8080`, `8081` y `8082`.
+El proyecto utiliza tres servicios CockroachDB:
 
-### Inicialización del clúster: solo si es un clúster nuevo
+| Nodo | Puerto SQL | Admin UI |
+|---|---:|---:|
+| cockroach1 | 26257 | 8080 |
+| cockroach2 | 26258 | 8081 |
+| cockroach3 | 26259 | 8082 |
 
-Si los volúmenes de datos de CockroachDB están vacíos y el clúster nunca se ha inicializado, ejecutar una sola vez:
+### Inicialización de un clúster nuevo
+
+Este paso se ejecuta únicamente cuando los volúmenes están vacíos y el clúster nunca ha sido inicializado:
 
 ```bash
 docker compose exec cockroach1 cockroach init --insecure --host=cockroach1:26257
 ```
 
-**No repetir la inicialización en un clúster ya inicializado.** Si se trasladó/copió el proyecto y Docker está usando los volúmenes anteriores, el clúster y sus datos pueden seguir existiendo; primero verificar el estado.
+No repetir este comando sobre un clúster inicializado.
 
-Consultar los nodos:
+Verificar la membresía:
 
 ```bash
 docker compose exec cockroach1 cockroach node status --insecure --host=cockroach1:26257
 ```
 
-## 6. Base de datos y esquema
+Se deben identificar los tres nodos.
 
-El backend usa la base de datos `distributed_ml`.
+### Acceso a las consolas de administración
 
-Consultar si la base existe:
+- DB1: http://127.0.0.1:8080
+- DB2: http://127.0.0.1:8081
+- DB3: http://127.0.0.1:8082
 
+## 5. Crear la base de datos y preparar el esquema
 
-```bash
-docker compose exec cockroach1 cockroach sql --insecure --host=cockroach1:26257 --database=distributed_ml -e "SELECT current_database();"
-```
+La base de datos utilizada por el proyecto es `distributed_ml`.
 
-Si el clúster es completamente nuevo, crear la base (una sola vez):
-
-```bash
-docker compose exec cockroach1 cockroach sql --insecure --host=cockroach1:26257 -e "CREATE DATABASE distributed_ml;"
-```
-
-El esquema inicial contiene cinco tablas: `nodes`, `datasets`, `jobs`, `tasks` y `results`, junto con sus relaciones e índices. Aplicar el SQL de creación de esquema desde la documentación/archivo SQL del proyecto cuando se prepare una base nueva. No ejecutar nuevamente el DDL en una base que ya tenga esas tablas, salvo que se trate de una migración deliberada.
-
-Verificar las tablas:
+Consultar si ya existe:
 
 ```bash
-docker compose exec cockroach1 cockroach sql --insecure --host=cockroach1:26257 --database=distributed_ml -e "SHOW TABLES;"
+docker compose exec cockroach1 cockroach sql --insecure --execute "SHOW DATABASES;"
 ```
 
-## 7. Configuración de la conexión backend
+Si no existe, crearla:
 
-`backend/database/connection.py` usa la variable de entorno `DATABASE_URL` si está definida. Si no está definida, el valor predeterminado de desarrollo local es:
-
-```text
-postgresql://root@127.0.0.1:26257/distributed_ml?sslmode=disable
+```bash
+docker compose exec cockroach1 cockroach sql --insecure --execute "CREATE DATABASE distributed_ml;"
 ```
 
-Este valor funciona cuando FastAPI se ejecuta directamente en el equipo (fuera de Docker) y CockroachDB publica el puerto `26257`.
+### Esquema de aplicación
 
-Si una variable `DATABASE_URL` previa quedó definida en la terminal, puede sobrescribir el valor predeterminado. Para quitarla temporalmente en Git Bash:
+La instalación necesita las tablas y estructuras de persistencia del proyecto, incluyendo:
+
+- `nodes`
+- `datasets`
+- `jobs`
+- `tasks`
+- `results`
+- `cluster_leadership`
+
+**Importante:** antes de ejecutar una instalación desde cero, verificar el DDL vigente y las migraciones de `backend/database/`. No asumir que `backend/database/schema.sql` contiene el esquema completo ni ejecutar DDL antiguo sobre una base existente.
+
+Para una base ya creada, aplicar `backend/database/migrations/001_make_requested_workers_nullable.sql` antes de desplegar esta versión. La migración solo elimina `NOT NULL` y conserva los valores históricos.
+
+Una vez aplicado el esquema correspondiente, verificar:
+
+```bash
+docker compose exec cockroach1 cockroach sql --insecure --database=distributed_ml --execute "SHOW TABLES;"
+```
+
+La instalación solo está lista para continuar cuando las tablas requeridas por la implementación actual existen.
+
+## 6. Configurar la conexión a CockroachDB
+
+FastAPI y los Workers utilizan la variable `DATABASE_URL`.
+
+La conexión local predeterminada es:
+
+```bash
+export DATABASE_URL="postgresql://root@127.0.0.1:26257/distributed_ml?sslmode=disable"
+```
+
+Ejecutar este comando en cada terminal Git Bash que vaya a iniciar FastAPI o un Worker.
+
+Si se desea volver al valor predeterminado del proyecto:
 
 ```bash
 unset DATABASE_URL
 ```
 
-Si FastAPI se ejecuta dentro de un contenedor Docker, `127.0.0.1` ya no apunta al host ni a otro contenedor; se deberá configurar la URL con el nombre DNS del servicio de Compose, por ejemplo `cockroach1`, y el puerto interno `26257`. La ejecución del backend dentro de Docker no está configurada como parte del Compose actual.
+La configuración corresponde a un entorno local de desarrollo con CockroachDB en modo insecure. No utilizarla como configuración de producción.
 
-## 8. Ejecutar FastAPI
+## 7. Iniciar FastAPI
 
-Desde la raíz del proyecto, activar el entorno virtual e iniciar Uvicorn:
+Abrir una terminal Git Bash desde la raíz del proyecto.
 
+Activar el entorno:
 
 ```bash
 source .venv/Scripts/activate
+```
+
+Configurar la conexión:
+
+```bash
+export DATABASE_URL="postgresql://root@127.0.0.1:26257/distributed_ml?sslmode=disable"
+```
+
+Entrar al backend:
+
+```bash
 cd backend
-python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Mantener esta terminal abierta mientras se use la API.
-
-## 9. Verificar la aplicación
-
-En otra terminal de Git Bash, ejecutar:
-
+Iniciar el servidor:
 
 ```bash
-curl.exe -i http://127.0.0.1:8000/health
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-Respuesta esperada (el orden o los valores de campos podrían variar según implementación, pero deben indicar estado saludable y base de datos disponible):
+Mantener esta terminal abierta.
 
-```json
-{
-  "status": "healthy",
-  "application": "available",
-  "database": "available"
-}
-```
+Direcciones disponibles:
 
-Un HTTP `200 OK` y el indicador `database: available` confirman que FastAPI está activo y que la verificación de conexión a CockroachDB funcionó.
+- Aplicación web: http://127.0.0.1:8000/
+- Estado de la API: http://127.0.0.1:8000/health
+- Estado técnico del clúster: http://127.0.0.1:8000/cluster/technical-status
+- Documentación de API: http://127.0.0.1:8000/docs
 
-## 10. Puertos locales
+FastAPI sirve tanto la interfaz como los endpoints de la aplicación.
 
-| Servicio | Puerto del host |
-|---|---:|
-| FastAPI / Uvicorn | `8000` |
-| CockroachDB SQL — nodo 1 | `26257` |
-| CockroachDB SQL — nodo 2 | `26258` |
-| CockroachDB SQL — nodo 3 | `26259` |
-| CockroachDB Admin — nodo 1 | `8080` |
-| CockroachDB Admin — nodo 2 | `8081` |
-| CockroachDB Admin — nodo 3 | `8082` |
+## 8. Iniciar los Workers
 
-## 11. Qué se conserva y qué se recrea al mover el proyecto
+Para el funcionamiento completo del entorno de demostración, iniciar tres procesos Worker independientes.
 
-- **Código y documentación:** copiar/checkout desde Git.
-- **`.venv`:** recrear localmente; no compartirlo ni versionarlo.
-- **Dependencias Python:** instalar desde `backend/requirements.txt`.
-- **Contenedores:** recrearlos con `docker compose up -d`.
-- **Datos CockroachDB:** viven en volúmenes Docker, no dentro de los archivos del repositorio. Copiar la carpeta del proyecto no copia estos volúmenes. Docker Compose puede usar volúmenes existentes o crear volúmenes nuevos según el nombre del proyecto/configuración; verificar los datos antes de asumir que la base está presente.
-- **`.env`:** archivo local no versionado. Si el proyecto necesita variables adicionales, crear el `.env` a partir de `.env.example` y rellenarlo; no compartir secretos.
-- **Archivos CSV/datasets locales:** pueden estar dentro de `backend/storage/`; confirmar política de respaldo/versionado y no subir datos sensibles.
+Abrir tres terminales Git Bash adicionales.
 
-## 12. Reiniciar el entorno en el día a día
-
-Después de preparar el equipo, el flujo habitual es:
-
+En cada terminal, desde la raíz del proyecto:
 
 ```bash
-# Desde la raíz del proyecto
+source .venv/Scripts/activate
+export DATABASE_URL="postgresql://root@127.0.0.1:26257/distributed_ml?sslmode=disable"
+cd backend
+python -m workers.worker --backend-url http://127.0.0.1:8000
+```
+
+Ejecutar el mismo comando en las tres terminales.
+
+Cada proceso se registra de manera independiente y publica su Heartbeat y métricas en CockroachDB.
+
+Mantener las terminales abiertas mientras se quiera conservar los Workers activos.
+
+## 9. Verificar el funcionamiento
+
+Con CockroachDB, FastAPI y los tres Workers en ejecución, abrir otra terminal Git Bash.
+
+### Verificar CockroachDB
+
+```bash
+docker compose ps
+docker compose exec cockroach1 cockroach node status --insecure --host=cockroach1:26257
+```
+
+### Verificar FastAPI
+
+```bash
+curl -i http://127.0.0.1:8000/health
+```
+
+La respuesta debe indicar que la aplicación y la conexión a la base de datos están disponibles.
+
+### Verificar la Vista técnica
+
+```bash
+curl -i http://127.0.0.1:8000/cluster/technical-status
+```
+
+También se puede consultar directamente desde el navegador:
+
+http://127.0.0.1:8000/
+
+La Vista técnica debe reflejar los estados reales de los nodos, el liderazgo vigente, los Workers y los registros disponibles.
+
+La cantidad de registros y Workers puede variar según la actividad previa del entorno.
+
+## 10. Orden habitual de arranque
+
+Una vez configurado el equipo, el orden recomendado para iniciar una sesión de trabajo es:
+
+**1. Terminal 1 — CockroachDB**
+
+Desde la raíz:
+
+```bash
 docker compose up -d
-source .venv/Scripts/activate
-cd backend
-python -m uvicorn main:app --host 0.0.0.0 --port 8000
+docker compose ps
 ```
 
-Para detener FastAPI, usar `Ctrl+C` en la terminal de Uvicorn. Para detener los contenedores:
+**2. Terminal 2 — FastAPI**
+
+Desde la raíz:
+
+```bash
+source .venv/Scripts/activate
+export DATABASE_URL="postgresql://root@127.0.0.1:26257/distributed_ml?sslmode=disable"
+cd backend
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+**3. Terminales 3, 4 y 5 — Workers**
+
+En cada terminal:
+
+```bash
+source .venv/Scripts/activate
+export DATABASE_URL="postgresql://root@127.0.0.1:26257/distributed_ml?sslmode=disable"
+cd backend
+python -m workers.worker --backend-url http://127.0.0.1:8000
+```
+
+**4. Navegador**
+
+Abrir:
+
+http://127.0.0.1:8000/
+
+Con esto se dispone del clúster de base de datos, la API, los procesos Worker y la interfaz de monitoreo.
+
+## 11. Puertos utilizados
+
+| Servicio | Puerto |
+|---|---:|
+| FastAPI / Frontend | 8000 |
+| CockroachDB SQL — nodo 1 | 26257 |
+| CockroachDB SQL — nodo 2 | 26258 |
+| CockroachDB SQL — nodo 3 | 26259 |
+| CockroachDB Admin — nodo 1 | 8080 |
+| CockroachDB Admin — nodo 2 | 8081 |
+| CockroachDB Admin — nodo 3 | 8082 |
+
+## 12. Detener el entorno
+
+Para detener cada Worker y FastAPI, presionar `Ctrl + C` en sus respectivas terminales.
+
+Para detener los contenedores CockroachDB, desde la raíz:
 
 ```bash
 docker compose down
 ```
 
-`docker compose down` no elimina los volúmenes de datos por defecto. **No usar `docker compose down -v` a menos que se desee borrar los volúmenes y, con ellos, los datos persistidos de CockroachDB.**
+Este comando conserva los volúmenes persistentes.
 
-## 13. Estado y límites de esta guía
+**No ejecutar `docker compose down -v`** salvo que se desee eliminar también los volúmenes y todos los datos persistidos del clúster.
 
-Esta guía cubre la configuración local actual del backend y CockroachDB. No instala ni configura Workers, el proceso de entrenamiento, el scheduler, endpoints funcionales de datasets/jobs, ni despliegue de FastAPI en contenedor; esas piezas se implementarán en tareas posteriores.
+## 13. Consideraciones importantes
+
+- Cada equipo debe crear su propio `.venv`.
+- Los datos de CockroachDB se conservan en volúmenes Docker y no se transfieren al copiar el repositorio.
+- La inicialización del clúster y la creación del esquema son operaciones de primer uso, no pasos del arranque diario.
+- FastAPI y los Workers deben utilizar una `DATABASE_URL` que apunte a una instancia accesible desde el equipo.
+- Cada Worker es un proceso independiente. Para visualizar tres Workers activos, deben ejecutarse tres procesos.
+- Los tres nodos CockroachDB se ejecutan en contenedores del mismo host físico; no representan tres servidores físicos independientes.
+- La Vista técnica consulta información real del sistema, pero la disponibilidad de cada componente no debe confundirse con la replicación física de todos los datos en cada nodo.

@@ -50,8 +50,8 @@ candidatos por capacidad.
   pueda medir de forma fiable queda en `NULL`. Los Heartbeats no provocan
   detección de expiración ni cambian automáticamente el estado a
   `offline`.
-- `backend/database/migrations/001_create_cluster_leadership.sql`
-  crea aditivamente la tabla de lease y la fila inicial `default`.
+- `backend/database/schema.sql` define la tabla de lease y la fila inicial
+  `default` como parte del esquema completo para una base nueva.
 - `repository.py` dispone de operaciones para las cinco tablas de
   aplicación y para inicializar/consultar, adquirir, renovar, liberar y
   validar el lease. Las operaciones que cambian estado reintentan
@@ -189,13 +189,11 @@ ordena candidatos, pero no otorga autoridad.
 
 ### 5.1 Lease persistente
 
-**Implementado:** la migración
-`backend/database/migrations/001_create_cluster_leadership.sql` crea la
-tabla `cluster_leadership`, con `leader_node_id` nullable y FK a
-`nodes(node_id)`, epoch no negativo, lease y timestamp. La migración
-inserta el registro `default` con propietario nulo, epoch 0 y lease
-expirado mediante `ON CONFLICT DO NOTHING`, por lo que volver a
-aplicarla no sobrescribe un liderazgo vigente.
+**Implementado:** `backend/database/schema.sql` crea la tabla
+`cluster_leadership`, con `leader_node_id` nullable y FK a
+`nodes(node_id)`, epoch no negativo, lease y timestamp. También inserta
+el registro `default` con propietario nulo, epoch 0 y lease expirado
+mediante `ON CONFLICT DO NOTHING`, sin sobrescribir un liderazgo vigente.
 
 La tabla singleton contiene:
 
@@ -428,18 +426,19 @@ Orden sugerido de implementación:
 7. Probar caídas de procesos, pérdida de un nodo DB, particiones de red
    y persistencia real; luego repetir en hosts físicos independientes.
 
-## 11. Migración y pruebas de liderazgo
+## 11. Esquema inicial y pruebas de liderazgo
 
-La migración aditiva se encuentra en
-[`backend/database/migrations/001_create_cluster_leadership.sql`](../backend/database/migrations/001_create_cluster_leadership.sql).
-En PowerShell, desde la raíz del repositorio y con Compose iniciado:
+El esquema completo para una base nueva se encuentra en
+[`backend/database/schema.sql`](../backend/database/schema.sql). En
+PowerShell, desde la raíz del repositorio y con un clúster nuevo iniciado:
 
 ```powershell
-Get-Content -Raw .\backend\database\migrations\001_create_cluster_leadership.sql | docker exec -i distributed-ml-db1 cockroach sql --insecure --database=distributed_ml
+Get-Content -Raw .\backend\database\schema.sql | docker exec -i distributed-ml-db1 cockroach sql --insecure --database=distributed_ml
 ```
 
-El script crea la tabla si no existe e inserta la fila `default` solo si
-falta; no elimina datos ni restablece epoch/propietario existentes.
+El esquema crea todas las tablas e índices desde cero; no ejecutarlo
+sobre una base existente. La fila `default` solo se inserta si falta y
+no restablece epoch/propietario existentes.
 `DATABASE_URL` permite cambiar el destino de las pruebas; sin ella, el
 pool usa el host local configurado en `connection.py`.
 

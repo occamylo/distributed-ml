@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      name="description"
+      content="Configura visualmente un entrenamiento de Distributed ML."
+    >
+    <title>Distributed ML — Nuevo entrenamiento</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <main class="app-window">
+      <header class="window-bar">
+        <a class="brand" href="#training" aria-label="Distributed ML, inicio">
+          <span class="brand-icon" aria-hidden="true">
+            <i></i><i></i><i></i><i></i>
+          </span>
+          <span>Distributed ML</span>
+        </a>
+        <div class="window-controls" aria-hidden="true">
+          <span class="window-control minimize"></span>
+          <span class="window-control maximize"></span>
+          <span class="window-control close"></span>
+        </div>
+      </header>
+
+      <section class="training-view" id="training-view" aria-labelledby="page-title">
+        <div class="page-top">
+          <span class="environment-label"><span></span>ESPACIO DE TRABAJO</span>
+          <button class="demo-link" id="open-demo" type="button">
+            <span class="demo-link-icon" aria-hidden="true">✦</span>
+            Vista técnica
+          </button>
+        </div>
+
+        <div class="intro">
+          <p class="eyebrow">MACHINE LEARNING, SIN COMPLICACIONES</p>
+          <h1 id="page-title">Tu pr&oacute;ximo modelo<br><span>empieza aqu&iacute;.</span></h1>
+          <p class="intro-copy">
+            Elige tus datos y un modelo para preparar un nuevo entrenamiento.
+          </p>
+        </div>
+
+        <div class="training-layout">
+          <form class="setup-card" id="training-form" aria-label="Configuración del dataset y el entrenamiento">
+            <div class="card-heading">
+              <span class="step-badge">01</span>
+              <div>
+                <h2>Prepara tu entrenamiento</h2>
+                <p>Solo necesitas un archivo CSV y un modelo.</p>
+              </div>
+              <span class="preview-tag">CONFIGURACIÓN</span>
+            </div>
+
+            <div class="form-field">
+              <label class="field-label" for="csv-file">
+                <span class="field-number">1</span>
+                Selecciona tu archivo
+              </label>
+              <label class="file-picker" for="csv-file">
+                <input
+                  class="visually-hidden"
+                  id="csv-file"
+                  name="csv-file"
+                  type="file"
+                  accept=".csv,text/csv"
+                  aria-describedby="file-help file-status"
+                >
+                <span class="upload-icon" aria-hidden="true">
+                  <svg viewBox="0 0 32 32">
+                    <path d="M16 21V8m0 0-5 5m5-5 5 5"></path>
+                    <path d="M8 20v5h16v-5"></path>
+                  </svg>
+                </span>
+                <span class="file-picker-copy">
+                  <strong>Elige un archivo CSV</strong>
+                  <small id="file-help">Busca un archivo en tu dispositivo</small>
+                </span>
+                <span class="browse-button">Elegir archivo</span>
+              </label>
+              <div class="selected-file" id="file-status" role="status" aria-live="polite" hidden>
+                <span class="csv-badge" aria-hidden="true">CSV</span>
+                <span class="selected-file-copy">
+                  <strong id="file-name"></strong>
+                  <small id="file-size"></small>
+                </span>
+                <span class="file-check" aria-hidden="true">✓</span>
+              </div>
+              <p class="form-status" id="dataset-upload-status" data-state="idle" role="status" aria-live="polite"></p>
+            </div>
+
+            <div class="form-field" id="target-field" hidden>
+              <label class="field-label" for="target-column">
+                <span class="field-number">3</span>
+                Elige la columna objetivo
+              </label>
+              <div class="select-wrap">
+                <select id="target-column" name="target-column" required>
+                  <option value="">Carga un CSV para ver sus columnas</option>
+                </select>
+                <span class="select-chevron" aria-hidden="true">⌄</span>
+              </div>
+              <p class="field-hint" id="target-hint"></p>
+              <div class="feature-preview">
+                <strong>Características de entrada</strong>
+                <span id="feature-columns">Selecciona la columna objetivo.</span>
+              </div>
+            </div>
+
+            <div class="form-field model-field">
+              <label class="field-label" for="model">
+                <span class="field-number">2</span>
+                Elige un modelo
+              </label>
+              <div class="select-wrap">
+                <span class="model-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24">
+                    <circle cx="12" cy="12" r="8"></circle>
+                    <path d="M8.5 14.5c1.7-3.1 3.8-4.8 7-5"></path>
+                    <circle cx="8.5" cy="14.5" r="1"></circle>
+                    <circle cx="15.5" cy="9.5" r="1"></circle>
+                  </svg>
+                </span>
+                <select id="model" name="model">
+                  <option value="logistic-regression">Regresi&oacute;n log&iacute;stica · clasificaci&oacute;n</option>
+                  <option value="linear-regression">Regresi&oacute;n lineal · regresi&oacute;n num&eacute;rica</option>
+                </select>
+                <span class="select-chevron" aria-hidden="true">⌄</span>
+              </div>
+              <p class="field-hint">El modelo y el target se validan al guardar la configuración.</p>
+            </div>
+
+            <div class="form-actions">
+              <button class="start-button" id="save-job" type="submit" disabled>
+                <span class="button-sparkle" aria-hidden="true">✦</span>
+                Guardar configuración
+                <span class="button-arrow" aria-hidden="true">→</span>
+              </button>
+              <p class="form-status" id="configuration-status" data-state="idle" role="status" aria-live="polite"></p>
+              <p class="coming-soon">Se guardará un Job pendiente; no se ejecutará entrenamiento.</p>
+            </div>
+          </form>
+
+          <aside class="guide-card" aria-label="Resumen del proceso">
+            <div class="guide-art" aria-hidden="true">
+              <span class="art-cloud"></span>
+              <span class="art-file"><i></i><i></i><i></i></span>
+              <span class="art-star art-star-one">✦</span>
+              <span class="art-star art-star-two">✧</span>
+              <span class="art-orbit"></span>
+            </div>
+            <p class="eyebrow">AS&Iacute; DE SENCILLO</p>
+            <h2>Un buen comienzo<br>para tus datos.</h2>
+            <p class="guide-copy">
+              Elige un archivo CSV y selecciona el modelo que quieres probar.
+            </p>
+            <div class="guide-steps">
+              <div><span class="guide-step-number">1</span><span>Escoge tu archivo</span><span class="step-check">✓</span></div>
+              <div><span class="guide-step-number">2</span><span>Selecciona un modelo</span><span class="step-check">✓</span></div>
+              <div><span class="guide-step-number guide-step-muted">3</span><span class="guide-step-muted">Inicia cuando est&eacute; listo</span><span class="step-lock" aria-hidden="true">⌑</span></div>
+            </div>
+            <p class="guide-footnote"><span aria-hidden="true">i</span>El CSV se carga para validar y guardar el dataset; el entrenamiento no se ejecuta.</p>
+          </aside>
+        </div>
+
+        <footer class="page-footer">
+          <span><span class="footer-mark" aria-hidden="true">✦</span> Distributed ML</span>
+          <span>Entrenamiento sencillo, ideas en movimiento.</span>
+        </footer>
+      </section>
+
+      <section class="demo-view" id="demo-view" aria-labelledby="demo-title" hidden>
+        <div class="demo-top">
+          <button class="back-link" id="back-to-training" type="button">
+            <span aria-hidden="true">←</span> Volver al entrenamiento
+          </button>
+          <span class="sample-label" id="last-updated">Sin actualizar</span>
+        </div>
+
+        <div class="demo-intro">
+          <p class="eyebrow">MONITOREO DEL SISTEMA DISTRIBUIDO</p>
+          <h1 id="demo-title">Vista t&eacute;cnica</h1>
+          <p>Estado real del cl&uacute;ster y de la aplicaci&oacute;n, actualizado autom&aacute;ticamente.</p>
+        </div>
+
+        <div class="demo-banner" id="technical-message" aria-live="polite">
+          <span class="banner-icon" aria-hidden="true">i</span>
+          <p><strong>Conectando con FastAPI.</strong> Estados operativos cada 4 segundos; rangos y eventos cada 15. El navegador no se conecta directamente a CockroachDB.</p>
+        </div>
+
+        <div class="tech-summary-grid">
+          <article class="demo-card status-card">
+            <div class="demo-card-heading">
+              <div>
+                <p class="eyebrow">ESTADO GENERAL</p>
+                <h2>API y base de datos</h2>
+              </div>
+              <span class="unavailable-tag" id="overall-state" data-state="loading">CARGANDO</span>
+            </div>
+            <p class="status-detail" id="overall-detail">Esperando la primera consulta.</p>
+          </article>
+
+          <article class="demo-card status-card">
+            <div class="demo-card-heading">
+              <div>
+                <p class="eyebrow">COORDINACI&Oacute;N DE LA APLICACI&Oacute;N</p>
+                <h2>Liderazgo vigente</h2>
+              </div>
+              <span class="unavailable-tag" id="leadership-state" data-state="loading">CARGANDO</span>
+            </div>
+            <div class="status-detail" id="leadership-detail">Consultando el lease de cluster_leadership.</div>
+            <p class="demo-disclaimer">Liderazgo de la aplicaci&oacute;n; no es el l&iacute;der interno de CockroachDB.</p>
+          </article>
+        </div>
+
+        <article class="demo-card topology-card">
+          <div class="demo-card-heading">
+            <div>
+              <p class="eyebrow">TOPOLOG&Iacute;A DECLARADA</p>
+              <h2>Tres servicios CockroachDB</h2>
+            </div>
+            <span class="source-tag">Configuraci&oacute;n + Cluster API</span>
+          </div>
+          <div class="topology-diagram" id="database-nodes" aria-live="polite">
+            <p class="empty-state">Consultando nodos CockroachDB...</p>
+          </div>
+          <p class="topology-note">La conexi&oacute;n SQL, la pertenencia al cl&uacute;ster y la respuesta de salud se muestran por separado.</p>
+        </article>
+
+        <div class="technical-grid">
+          <article class="demo-card">
+            <div class="demo-card-heading">
+              <div>
+                <p class="eyebrow">C&Oacute;MPUTO</p>
+                <h2>Workers registrados</h2>
+              </div>
+              <span class="unavailable-tag" id="workers-state" data-state="loading">CARGANDO</span>
+            </div>
+            <div class="worker-list" id="workers-list" aria-live="polite">
+              <p class="empty-state">Consultando heartbeat y disponibilidad...</p>
+            </div>
+          </article>
+
+          <article class="demo-card">
+            <div class="demo-card-heading">
+              <div>
+                <p class="eyebrow">CONSISTENCIA</p>
+                <h2>Replicaci&oacute;n del cl&uacute;ster</h2>
+              </div>
+              <span class="unavailable-tag" id="replication-state" data-state="loading">CARGANDO</span>
+            </div>
+            <div class="replication-list" id="replication-list" aria-live="polite">
+              <p class="empty-state">Consultando reportes de rangos...</p>
+            </div>
+            <p class="topology-note" id="replication-note"></p>
+          </article>
+        </div>
+
+        <section class="records-section" aria-labelledby="records-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">REGISTROS RECIENTES</p>
+              <h2 id="records-title">Jobs, Tasks y Datasets</h2>
+            </div>
+            <span class="unavailable-tag">LECTURA CADA 4 S</span>
+          </div>
+          <div class="records-grid">
+            <article class="demo-card record-card">
+              <h3>Jobs <span>&middot; &uacute;ltimos 5</span></h3>
+              <div class="record-list" id="jobs-list" aria-live="polite">
+                <p class="empty-state">Consultando Jobs...</p>
+              </div>
+            </article>
+            <article class="demo-card record-card">
+              <h3>Tasks <span>&middot; &uacute;ltimos 5</span></h3>
+              <div class="record-list" id="tasks-list" aria-live="polite">
+                <p class="empty-state">Consultando Tasks...</p>
+              </div>
+            </article>
+            <article class="demo-card record-card">
+              <h3>Datasets <span>&middot; &uacute;ltimos 5</span></h3>
+              <div class="record-list" id="datasets-list" aria-live="polite">
+                <p class="empty-state">Consultando Datasets...</p>
+              </div>
+            </article>
+          </div>
+          <p class="topology-note" id="tasks-note"></p>
+        </section>
+
+        <article class="demo-card activity-card">
+          <div class="demo-card-heading">
+            <div>
+              <p class="eyebrow">EVENTOS</p>
+              <h2>Actividad reciente</h2>
+            </div>
+            <span class="unavailable-tag" id="events-state" data-state="loading">CARGANDO</span>
+          </div>
+          <div class="event-list" id="events-list" aria-live="polite">
+            <p class="empty-state">Consultando eventos CockroachDB...</p>
+          </div>
+        </article>
+
+        <footer class="page-footer">
+          <span><span class="footer-mark" aria-hidden="true">✦</span> Distributed ML</span>
+          <span>Vista t&eacute;cnica · Solo lectura</span>
+        </footer>
+      </section>
+    </main>
+  </body>
+</html>

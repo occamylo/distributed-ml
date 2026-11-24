@@ -1,12 +1,15 @@
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from psycopg import Error as PsycopgError
 from psycopg_pool import PoolTimeout
 
+from api.cluster import router as cluster_router
 from api.datasets import router as datasets_router
 from api.jobs import router as jobs_router
 from api.nodes import router as nodes_router
@@ -29,6 +32,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Distributed ML API", lifespan=lifespan)
+app.include_router(cluster_router)
 app.include_router(nodes_router)
 app.include_router(datasets_router)
 app.include_router(jobs_router)
@@ -56,3 +60,13 @@ def health() -> JSONResponse:
             "database": "unavailable",
         },
     )
+
+
+app.mount(
+    "/",
+    StaticFiles(
+        directory=Path(__file__).resolve().parent.parent / "frontend",
+        html=True,
+    ),
+    name="frontend",
+)

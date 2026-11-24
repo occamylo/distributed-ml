@@ -37,7 +37,6 @@ _JOB_UPDATE_FIELDS = (
     "target_column",
     "status",
     "parameters",
-    "requested_workers",
     "actual_workers",
     "train_ratio",
     "seed",
@@ -433,6 +432,15 @@ def list_datasets() -> list[Record]:
     )
 
 
+def list_recent_datasets(limit: int = 5) -> list[Record]:
+    return _fetch_all(
+        "SELECT dataset_id, name, file_size_bytes, row_count, column_count, "
+        "file_format, created_at FROM datasets "
+        "ORDER BY created_at DESC, dataset_id DESC LIMIT %s",
+        (limit,),
+    )
+
+
 def delete_dataset(dataset_id: UUID) -> bool:
     query = sql.SQL("DELETE FROM {} WHERE {} = %s RETURNING {}").format(
         sql.Identifier("datasets"),
@@ -446,7 +454,6 @@ def create_job(
     dataset_id: UUID,
     algorithm: str,
     target_column: str,
-    requested_workers: int,
     status: str = "pending",
     parameters: Any = None,
     actual_workers: int | None = None,
@@ -464,7 +471,6 @@ def create_job(
             "target_column": target_column,
             "status": status,
             "parameters": Jsonb({} if parameters is None else parameters),
-            "requested_workers": requested_workers,
             "actual_workers": actual_workers,
             "train_ratio": train_ratio,
             "seed": seed,
@@ -481,6 +487,15 @@ def get_job(job_id: UUID) -> Record | None:
 
 def list_jobs() -> list[Record]:
     return _fetch_all("SELECT * FROM jobs ORDER BY created_at ASC, job_id ASC")
+
+
+def list_recent_jobs(limit: int = 5) -> list[Record]:
+    return _fetch_all(
+        "SELECT job_id, dataset_id, algorithm, target_column, status, "
+        "requested_workers, actual_workers, created_at, started_at, completed_at "
+        "FROM jobs ORDER BY created_at DESC, job_id DESC LIMIT %s",
+        (limit,),
+    )
 
 
 def update_job(job_id: UUID, fields: Mapping[str, Any]) -> Record | None:
@@ -589,6 +604,22 @@ def list_tasks_by_job(job_id: UUID) -> list[Record]:
         "WHERE job_id = %s "
         "ORDER BY partition_index ASC, task_id ASC",
         (job_id,),
+    )
+
+
+def list_recent_tasks(limit: int = 5) -> list[Record]:
+    return _fetch_all(
+        "SELECT tasks.task_id, tasks.job_id, tasks.node_id, "
+        "tasks.partition_index, tasks.rows_assigned, tasks.status, "
+        "tasks.attempts, tasks.started_at, tasks.completed_at, "
+        "COALESCE(tasks.completed_at, tasks.started_at, jobs.created_at) "
+        "AS activity_at, "
+        "CASE WHEN tasks.completed_at IS NOT NULL THEN 'completed_at' "
+        "WHEN tasks.started_at IS NOT NULL THEN 'started_at' "
+        "ELSE 'job_created_at' END AS activity_at_source "
+        "FROM tasks JOIN jobs ON jobs.job_id = tasks.job_id "
+        "ORDER BY activity_at DESC, tasks.task_id DESC LIMIT %s",
+        (limit,),
     )
 
 

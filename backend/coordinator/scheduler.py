@@ -87,19 +87,12 @@ class Scheduler:
 
     def _schedule_job(self, job: Record, epoch: int) -> bool:
         job_id = job.get("job_id")
-        requested_workers = job.get("requested_workers")
         dataset_id = job.get("dataset_id")
-        if (
-            not isinstance(job_id, UUID)
-            or not isinstance(dataset_id, UUID)
-            or not isinstance(requested_workers, int)
-            or isinstance(requested_workers, bool)
-            or requested_workers <= 0
-        ):
+        if not isinstance(job_id, UUID) or not isinstance(dataset_id, UUID):
             logger.error("Skipping Job with invalid scheduling fields: %s.", job_id)
             return True
 
-        workers = self._eligible_workers(requested_workers)
+        workers = self._eligible_workers()
         if not workers:
             logger.debug("No eligible Workers are currently available for Job %s.", job_id)
             return True
@@ -131,32 +124,17 @@ class Scheduler:
                 return self._retains_leadership(epoch)
             tasks = created_tasks
 
-        if len(tasks) > requested_workers:
-            logger.error(
-                "Skipping Job %s because it has %s Tasks for only %s requested Workers.",
-                job_id,
-                len(tasks),
-                requested_workers,
-            )
-            return True
-
         assigned_node_ids = {
             task.get("node_id")
             for task in tasks
             if isinstance(task.get("node_id"), UUID)
         }
-        if len(assigned_node_ids) > requested_workers:
-            logger.error(
-                "Skipping Job %s because its Tasks exceed the requested Worker count.",
-                job_id,
-            )
-            return True
 
         available_node_ids = [
             worker["node_id"]
             for worker in workers
             if worker["node_id"] not in assigned_node_ids
-        ][: max(0, requested_workers - len(assigned_node_ids))]
+        ]
         pending_tasks = [
             task
             for task in tasks
@@ -201,7 +179,7 @@ class Scheduler:
                 if isinstance(task.get("node_id"), UUID)
             }
         )
-        if actual_workers == 0 or actual_workers > requested_workers:
+        if actual_workers == 0:
             logger.error(
                 "Job %s has an invalid assigned Worker count (%s).",
                 job_id,
@@ -237,7 +215,7 @@ class Scheduler:
             )
         return True
 
-    def _eligible_workers(self, requested_workers: int) -> list[Record]:
+    def _eligible_workers(self) -> list[Record]:
         eligible: list[Record] = []
         for node in list_nodes_with_fresh_metrics():
             node_id = node.get("node_id")
@@ -269,7 +247,7 @@ class Scheduler:
                 str(node["node_id"]),
             )
         )
-        return eligible[:requested_workers]
+        return eligible
 
     def _current_leader_epoch(self) -> int | None:
         if not self._coordination.is_leader:

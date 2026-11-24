@@ -35,7 +35,7 @@ CREATE TABLE jobs (
     target_column STRING NOT NULL,
     status STRING NOT NULL DEFAULT 'pending',
     parameters JSONB NOT NULL DEFAULT '{}'::JSONB,
-    requested_workers INT4 NOT NULL,
+    requested_workers INT4,
     actual_workers INT4,
     train_ratio FLOAT8,
     seed INT8,
@@ -47,7 +47,8 @@ CREATE TABLE jobs (
         CHECK (status IN (
             'pending', 'running', 'completed', 'failed', 'cancelled'
         )),
-    CONSTRAINT chk_requested_workers CHECK (requested_workers > 0),
+    CONSTRAINT chk_requested_workers
+        CHECK (requested_workers IS NULL OR requested_workers > 0),
     CONSTRAINT chk_train_ratio
         CHECK (train_ratio IS NULL OR (train_ratio > 0 AND train_ratio < 1))
 );
